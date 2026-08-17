@@ -1,4 +1,4 @@
-# DEPLOYMENT GUIDE — GENROSE Room Scene Analyzer v0.5.0
+# DEPLOYMENT GUIDE — GENROSE Room Scene Analyzer v0.5.2
 
 You do not need to install Python locally. Everything can be done in a browser.
 
@@ -14,8 +14,8 @@ You do not need to install Python locally. Everything can be done in a browser.
 5. Choose **Private** if you do not want the code public.
 6. Click **Create repository**.
 7. On the empty repository page, click **uploading an existing file**.
-8. Unzip the downloaded `Slab_Room_Scene_Manager_v0.5.0.zip`.
-9. Open the folder `Slab_Room_Scene_Manager_v0.5.0`.
+8. Unzip the downloaded `Slab_Room_Scene_Manager_v0.5.2.zip`.
+9. Open the folder `Slab_Room_Scene_Manager_v0.5.2`.
 10. Drag everything INSIDE that folder into GitHub.
     The GitHub repository root should directly contain:
     - `app.py`
@@ -283,3 +283,10 @@ Your analysis/review system is working; only the email provider settings need at
 ### A filename contains Italian but room is wrong
 The review page lets the reviewer override it. Add the missing term to `ROOM_ALIASES`
 in `app.py` for future batches.
+
+
+## If every result is Unknown / 0%
+v0.5.2 prevents this failure mode. If Google Cloud returns a 403 because Vision is
+disabled in the service-account project, the app still returns filename + room results.
+Enable Cloud Vision in the exact project named by the Google error to restore cloud
+enrichment.

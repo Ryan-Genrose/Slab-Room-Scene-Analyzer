@@ -32,7 +32,7 @@ try:
 except Exception:
     GOOGLE_LIBS = False
 
-st.set_page_config(page_title="GENROSE Room Scene Analyzer", page_icon="🪨", layout="wide")
+st.set_page_config(page_title="GENROSE Room Scene Analyzer", page_icon="🪨", layout="wide", initial_sidebar_state="collapsed")
 
 ROOT = Path(__file__).parent
 CATALOG_PATH = ROOT / "data" / "stone_sku_master.csv"
@@ -300,34 +300,51 @@ def product_client():
     return vision.ProductSearchClient(credentials=google_credentials())
 
 def run_google_vision(image_bytes):
-    """Always-used Cloud Vision pass: labels + web detection + OCR."""
+    """Cloud Vision pass: labels + web detection + OCR.
+
+    IMPORTANT: Cloud failure must NEVER destroy filename/room analysis.
+    This function always returns a result dictionary, even when Google returns
+    a permissions/API/billing error.
+    """
     if not vision_ready():
-        return {"labels": [], "web_entities": [], "web_pages": [], "text": "", "error": "Vision not configured"}
+        return {
+            "labels": [], "web_entities": [], "web_pages": [], "text": "",
+            "error": "Vision not configured"
+        }
 
-    client = image_client()
-    image = vision.Image(content=image_bytes)
-    features = [
-        vision.Feature(type_=vision.Feature.Type.LABEL_DETECTION, max_results=20),
-        vision.Feature(type_=vision.Feature.Type.WEB_DETECTION, max_results=20),
-        vision.Feature(type_=vision.Feature.Type.TEXT_DETECTION, max_results=5),
-    ]
-    req = vision.AnnotateImageRequest(image=image, features=features)
-    resp = client.batch_annotate_images(requests=[req]).responses[0]
+    try:
+        client = image_client()
+        image = vision.Image(content=image_bytes)
+        features = [
+            vision.Feature(type_=vision.Feature.Type.LABEL_DETECTION, max_results=20),
+            vision.Feature(type_=vision.Feature.Type.WEB_DETECTION, max_results=20),
+            vision.Feature(type_=vision.Feature.Type.TEXT_DETECTION, max_results=5),
+        ]
+        req = vision.AnnotateImageRequest(image=image, features=features)
+        resp = client.batch_annotate_images(requests=[req]).responses[0]
 
-    if resp.error.message:
-        return {"labels": [], "web_entities": [], "web_pages": [], "text": "", "error": resp.error.message}
+        if resp.error.message:
+            return {
+                "labels": [], "web_entities": [], "web_pages": [], "text": "",
+                "error": resp.error.message
+            }
 
-    labels = [x.description for x in resp.label_annotations]
-    web_entities = [x.description for x in resp.web_detection.web_entities if x.description]
-    web_pages = [x.url for x in resp.web_detection.pages_with_matching_images if x.url][:10]
-    text = resp.text_annotations[0].description if resp.text_annotations else ""
-    return {
-        "labels": labels,
-        "web_entities": web_entities,
-        "web_pages": web_pages,
-        "text": text,
-        "error": ""
-    }
+        labels = [x.description for x in resp.label_annotations]
+        web_entities = [x.description for x in resp.web_detection.web_entities if x.description]
+        web_pages = [x.url for x in resp.web_detection.pages_with_matching_images if x.url][:10]
+        text = resp.text_annotations[0].description if resp.text_annotations else ""
+        return {
+            "labels": labels,
+            "web_entities": web_entities,
+            "web_pages": web_pages,
+            "text": text,
+            "error": ""
+        }
+    except Exception as e:
+        return {
+            "labels": [], "web_entities": [], "web_pages": [], "text": "",
+            "error": str(e)
+        }
 
 def run_product_search(image_bytes, limit=8):
     """Visual similarity against the website-built reference catalog."""
@@ -1175,30 +1192,178 @@ st.session_state.setdefault("review_url", "")
 
 st.markdown("""
 <style>
-.block-container{max-width:1900px;padding-top:1rem}
-html,body,[class*="css"]{font-size:18px}
-h1{font-size:2.25rem!important}
-.rs-chip{display:inline-block;padding:4px 8px;border-radius:999px;font-size:13px;font-weight:800;margin-right:5px}
-.rs-good{background:#153c2b;color:#a0e8bd;border:1px solid #327559}
-.rs-mid{background:#4c3417;color:#ffd38a;border:1px solid #825e2f}
-.rs-bad{background:#4b2024;color:#ffb5bc;border:1px solid #7e383f}
-.rs-info{background:#173149;color:#afd3ef;border:1px solid #315e7e}
-.rs-path{font-family:monospace;word-break:break-all;padding:10px;background:#09131d;border-radius:8px;border:1px dashed #3a526d}
+:root {
+  --bg:#0b0f14;
+  --panel:#111821;
+  --panel-2:#151f2b;
+  --line:#273444;
+  --text:#f4efe6;
+  --muted:#93a0ad;
+  --accent:#c9ff3d;
+  --warn:#f6c95c;
+  --bad:#ff6b6b;
+  --good:#7ee2a8;
+}
+html, body, [data-testid="stAppViewContainer"] {
+  background: var(--bg);
+  color: var(--text);
+}
+[data-testid="stAppViewContainer"] > .main {
+  background:
+    radial-gradient(circle at 78% -10%, rgba(201,255,61,.08), transparent 30%),
+    linear-gradient(180deg,#0b0f14 0%,#0c1118 100%);
+}
+.block-container {
+  max-width: 1720px;
+  padding-top: 1.1rem;
+  padding-bottom: 3rem;
+}
+[data-testid="stHeader"] {background: transparent;}
+[data-testid="stSidebar"] {
+  background:#0e141c;
+  border-right:1px solid var(--line);
+}
+h1,h2,h3 {letter-spacing:-.025em;}
+h1 {font-size:2.25rem!important; margin-bottom:.25rem!important;}
+h2 {font-size:1.45rem!important;}
+h3 {font-size:1.12rem!important;}
+p, label, div {line-height:1.4;}
+[data-testid="stFileUploader"] {
+  border:1px dashed #405164;
+  border-radius:18px;
+  padding:.4rem;
+  background:linear-gradient(180deg,#101823,#0d141c);
+}
+[data-testid="stFileUploader"]:hover {
+  border-color:#6e8143;
+}
+[data-testid="stMetric"] {
+  background:linear-gradient(180deg,#121a24,#0f161f);
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:16px 18px;
+}
+[data-testid="stMetricValue"] {
+  color:var(--text);
+  font-size:1.8rem;
+  font-weight:800;
+}
+[data-testid="stMetricLabel"] {color:var(--muted);}
+.stButton > button, .stDownloadButton > button, [data-testid="stLinkButton"] a {
+  border-radius:10px!important;
+  min-height:42px;
+  font-weight:800;
+  letter-spacing:.01em;
+  border:1px solid #334255!important;
+}
+.stButton > button[kind="primary"] {
+  background:var(--accent)!important;
+  color:#0b0f14!important;
+  border-color:var(--accent)!important;
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+  border-color:#708295!important;
+}
+[data-testid="stExpander"] {
+  background:#101720;
+  border:1px solid var(--line)!important;
+  border-radius:12px!important;
+}
+[data-testid="stDataFrame"] {
+  border:1px solid var(--line);
+  border-radius:12px;
+  overflow:hidden;
+}
+[data-testid="stImage"] img {
+  border-radius:16px;
+}
+[data-testid="stTextInput"] input, [data-testid="stSelectbox"] > div > div {
+  background:#0d141c!important;
+  border-color:#334255!important;
+  color:var(--text)!important;
+}
+.ds-kicker {
+  color:var(--accent);
+  font-size:.78rem;
+  font-weight:900;
+  letter-spacing:.18em;
+  text-transform:uppercase;
+  margin-bottom:.45rem;
+}
+.ds-sub {
+  color:var(--muted);
+  font-size:1rem;
+  max-width:850px;
+  margin-bottom:1.2rem;
+}
+.ds-shell {
+  background:linear-gradient(180deg,#111923,#0e151d);
+  border:1px solid var(--line);
+  border-radius:18px;
+  padding:18px;
+}
+.ds-section-title {
+  font-size:.78rem;
+  font-weight:900;
+  letter-spacing:.13em;
+  text-transform:uppercase;
+  color:#9cafbf;
+  margin-bottom:.75rem;
+}
+.ds-chip {
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:5px 9px;
+  border-radius:999px;
+  font-size:12px;
+  font-weight:900;
+  margin:0 5px 6px 0;
+  border:1px solid transparent;
+}
+.ds-chip.good{background:#143126;color:#9ee8bb;border-color:#29583f}
+.ds-chip.mid{background:#352b15;color:#f8d886;border-color:#5b4821}
+.ds-chip.bad{background:#341a1d;color:#ffb0b0;border-color:#603036}
+.ds-chip.info{background:#152638;color:#b9d6ed;border-color:#284963}
+.ds-filename {
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  word-break:break-word;
+  padding:11px 12px;
+  border-radius:10px;
+  background:#090e14;
+  border:1px solid #2b394a;
+  color:#dbe5ef;
+}
+.ds-result-head {
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:12px;
+}
+.ds-material {
+  font-size:1.45rem;
+  font-weight:900;
+  letter-spacing:-.02em;
+}
+.ds-small {color:var(--muted);font-size:.88rem;}
+.ds-rule {height:1px;background:var(--line);margin:1rem 0;}
 </style>
 """, unsafe_allow_html=True)
 
-top1, top2 = st.columns([4, 1])
-with top1:
-    st.title("GENROSE Room Scene Analyzer")
-    st.caption("Filename first → Italian room normalization → master SKU match → website verification → Google Cloud Vision fallback")
-with top2:
-    st.metric("Materials", len(catalog_records))
+st.markdown('<div class="ds-kicker">GENROSE · INTERNAL TOOL</div>', unsafe_allow_html=True)
+st.title("Room Scene Analyzer")
+st.markdown(
+    '<div class="ds-sub">Drop a batch of manufacturer room scenes. The app reads the original filename first, '
+    'normalizes English/Italian room terms, matches the material + SKU, verifies against GENROSE references, '
+    'and only leans on Google Vision when the filename is weak.</div>',
+    unsafe_allow_html=True
+)
 
 website_cache = load_website_cache()
 website_count = sum(1 for x in website_cache.get("materials", {}).values() if x.get("status") == "OK")
 
 with st.sidebar:
-    st.header("System")
+    st.header("Admin")
     if st.button("🧹 Clear Batch", use_container_width=True):
         st.session_state.pending = []
         st.session_state.results = []
@@ -1208,11 +1373,12 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.subheader("Google Cloud")
+    st.subheader("Connections")
     if vision_ready():
-        st.success("Cloud Vision: READY")
+        st.success("Cloud Vision credentials: LOADED")
+        st.caption("A real API call is tested during analysis. If the API is disabled in that Google project, local filename matching still continues.")
     else:
-        st.error("Cloud Vision: NOT CONFIGURED")
+        st.error("Cloud Vision credentials: NOT CONFIGURED")
     if storage_ready():
         st.success("Cloud Storage: READY")
     else:
@@ -1223,7 +1389,7 @@ with st.sidebar:
         st.warning("Visual Product Search: NOT CONFIGURED")
 
     st.divider()
-    st.subheader("Website reference catalog")
+    st.subheader("Reference Catalog")
     st.write(f"Website products cached: **{website_count} / {len(catalog_records)}**")
     if website_cache.get("synced_at"):
         st.caption("Last sync: " + website_cache["synced_at"][:19].replace("T", " "))
@@ -1248,13 +1414,15 @@ with st.sidebar:
                 st.exception(e)
 
     st.divider()
-    st.caption("Daily workflow: you only need the main upload + Analyze button. Website sync is an admin/setup task.")
+    st.caption("You should rarely need this panel after setup.")
 
+st.markdown('<div class="ds-section-title">01 · Add room scenes</div>', unsafe_allow_html=True)
 uploads = st.file_uploader(
-    "Drag & drop room scene images",
+    "Drop JPG / PNG / WEBP files here",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
-    key=f"upload_{st.session_state.upload_key}"
+    key=f"upload_{st.session_state.upload_key}",
+    label_visibility="collapsed"
 )
 
 if uploads:
@@ -1268,10 +1436,15 @@ if uploads:
 pending = st.session_state.pending
 
 if pending and not st.session_state.results:
-    st.success(f"{len(pending)} images ready.")
+    st.markdown(
+        f'<div class="ds-shell"><div class="ds-section-title">02 · Analyze</div>'
+        f'<div style="font-size:1.15rem;font-weight:800">{len(pending)} images loaded</div>'
+        f'<div class="ds-small">Filename parsing runs first. Google Vision is enrichment/fallback, not the only matching method.</div></div>',
+        unsafe_allow_html=True
+    )
     if not vision_ready():
-        st.warning("Google Cloud Vision is not configured. ANALYZE will not run until credentials are added.")
-    if st.button(f"ANALYZE {len(pending)} IMAGES", type="primary", use_container_width=True, disabled=not vision_ready()):
+        st.warning("Google Cloud Vision is not configured. Filename + Italian/English room analysis will still run; cloud enrichment will be skipped.")
+    if st.button(f"RUN ANALYSIS · {len(pending)} IMAGES", type="primary", use_container_width=True):
         progress = st.progress(0, text="Starting analysis…")
         results = []
         for i, item in enumerate(pending, start=1):
@@ -1333,13 +1506,14 @@ for x in results:
 high = sum(x["analysis"]["material_confidence"] >= 90 and x["analysis"]["room_confidence"] >= 70 for x in results)
 review = len(results) - high
 
+st.markdown('<div class="ds-section-title">03 · Results</div>', unsafe_allow_html=True)
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Images", len(results))
 m2.metric("Ready", high)
-m3.metric("Needs review", review)
-m4.metric("Website verified", sum(x["analysis"]["website_verified"] for x in results))
+m3.metric("Review", review)
+m4.metric("Website matched", sum(x["analysis"]["website_verified"] for x in results))
 
-pub1, pub2 = st.columns([1, 1])
+pub1, pub2 = st.columns([1.2, .8])
 if pub1.button("CREATE REVIEW LINK", type="primary", use_container_width=True):
     batch_id, url = save_review_batch(results)
     st.session_state.review_url = url
@@ -1357,7 +1531,7 @@ st.divider()
 left, center, right = st.columns([1.0, 1.55, 1.1], gap="large")
 
 with left:
-    st.subheader("Results")
+    st.subheader("Queue")
     q = st.text_input("Search", placeholder="filename, material, SKU, room")
     for i, x in enumerate(results):
         a = x["analysis"]
@@ -1378,26 +1552,32 @@ item = results[idx]
 analysis = item["analysis"]
 
 with center:
-    st.subheader("Scene")
+    st.subheader("Preview")
     st.image(Image.open(io.BytesIO(item["bytes"])), use_container_width=True)
     st.caption(item["name"])
-    cls = "rs-good" if analysis["material_confidence"] >= 90 else "rs-mid" if analysis["material_confidence"] >= 70 else "rs-bad"
+    cls = "good" if analysis["material_confidence"] >= 90 else "mid" if analysis["material_confidence"] >= 70 else "bad"
     st.markdown(
-        f'<span class="rs-chip {cls}">Material {analysis["material_confidence"]}%</span>'
-        f'<span class="rs-chip rs-info">Room {analysis["room_confidence"]}%</span>'
-        f'<span class="rs-chip rs-info">{html.escape(analysis["material_method"])}</span>',
+        f'<span class="ds-chip {cls}">Material {analysis["material_confidence"]}%</span>'
+        f'<span class="ds-chip info">Room {analysis["room_confidence"]}%</span>'
+        f'<span class="ds-chip info">{html.escape(analysis["material_method"])}</span>',
         unsafe_allow_html=True
     )
 
 with right:
-    st.subheader("Proposed result")
-    st.markdown(f"### {item['stone'] or 'Unknown material'}")
-    st.write(f"**SKU:** `{item['sku'] or 'NEED-SKU'}`")
-    st.write(f"**Room:** {item['room']}")
-    st.markdown("**New filename**")
-    st.markdown(f'<div class="rs-path">{html.escape(item["new_name"])}</div>', unsafe_allow_html=True)
+    st.subheader("Match")
+    st.markdown(
+        f'<div class="ds-result-head"><div>'
+        f'<div class="ds-material">{html.escape(item["stone"] or "Unknown material")}</div>'
+        f'<div class="ds-small">SKU · {html.escape(item["sku"] or "NEED-SKU")} &nbsp;&nbsp; Room · {html.escape(item["room"])}</div>'
+        f'</div></div>',
+        unsafe_allow_html=True
+    )
+    st.markdown('<div class="ds-rule"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="ds-section-title">New filename</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="ds-filename">{html.escape(item["new_name"])}</div>', unsafe_allow_html=True)
 
-    st.markdown("**Why it chose this**")
+    st.markdown('<div class="ds-rule"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="ds-section-title">Why this match</div>', unsafe_allow_html=True)
     st.write(f"Filename material evidence: **{analysis['filename_material_score']}%**")
     st.write(f"Google Vision text/web evidence: **{analysis['vision_text_score']}%**")
     if analysis["visual_score"]:
@@ -1429,7 +1609,8 @@ with right:
     with st.expander("Google Vision evidence"):
         v = analysis["vision"]
         if v.get("error"):
-            st.warning(v["error"])
+            st.warning("Google Cloud Vision did not run for this image. Filename + room-name analysis was preserved.")
+            st.code(v["error"][:800])
         st.write("**Labels:**", ", ".join(v.get("labels", [])[:15]) or "—")
         st.write("**Web entities:**", ", ".join(v.get("web_entities", [])[:15]) or "—")
         if v.get("web_pages"):
