@@ -1192,173 +1192,363 @@ st.session_state.setdefault("review_url", "")
 
 st.markdown("""
 <style>
-:root {
-  --bg:#0b0f14;
-  --panel:#111821;
-  --panel-2:#151f2b;
-  --line:#273444;
-  --text:#f4efe6;
-  --muted:#93a0ad;
-  --accent:#c9ff3d;
-  --warn:#f6c95c;
-  --bad:#ff6b6b;
-  --good:#7ee2a8;
+:root{
+  --ink:#f7f5ef;
+  --muted:#a9b3bf;
+  --faint:#768392;
+  --bg:#080d13;
+  --panel:#0f1720;
+  --panel2:#121d28;
+  --panel3:#172432;
+  --line:#26384a;
+  --line2:#334b60;
+  --acid:#c8ff36;
+  --acid-soft:#23320d;
+  --blue:#6fc7ff;
+  --good:#7be2a8;
+  --warn:#ffc857;
+  --bad:#ff6b72;
 }
-html, body, [data-testid="stAppViewContainer"] {
-  background: var(--bg);
-  color: var(--text);
+
+html,body,[data-testid="stAppViewContainer"]{
+  background:var(--bg)!important;
+  color:var(--ink)!important;
 }
-[data-testid="stAppViewContainer"] > .main {
+[data-testid="stAppViewContainer"]>.main{
   background:
-    radial-gradient(circle at 78% -10%, rgba(201,255,61,.08), transparent 30%),
-    linear-gradient(180deg,#0b0f14 0%,#0c1118 100%);
+    radial-gradient(900px 420px at 72% -10%,rgba(104,198,255,.09),transparent 60%),
+    radial-gradient(850px 420px at 20% -15%,rgba(200,255,54,.08),transparent 62%),
+    var(--bg)!important;
 }
-.block-container {
-  max-width: 1720px;
-  padding-top: 1.1rem;
-  padding-bottom: 3rem;
+[data-testid="stHeader"]{background:transparent!important;}
+#MainMenu{visibility:hidden;}
+footer{visibility:hidden;}
+.block-container{
+  max-width:1760px!important;
+  padding:2.0rem 2.25rem 4rem!important;
 }
-[data-testid="stHeader"] {background: transparent;}
-[data-testid="stSidebar"] {
-  background:#0e141c;
-  border-right:1px solid var(--line);
+[data-testid="stSidebar"]{
+  background:#0a1118!important;
+  border-right:1px solid var(--line)!important;
 }
-h1,h2,h3 {letter-spacing:-.025em;}
-h1 {font-size:2.25rem!important; margin-bottom:.25rem!important;}
-h2 {font-size:1.45rem!important;}
-h3 {font-size:1.12rem!important;}
-p, label, div {line-height:1.4;}
-[data-testid="stFileUploader"] {
-  border:1px dashed #405164;
-  border-radius:18px;
-  padding:.4rem;
-  background:linear-gradient(180deg,#101823,#0d141c);
+[data-testid="stSidebar"] *{color:var(--ink)!important;}
+
+/* Typography */
+h1,h2,h3,h4,p,span,label,div{color:var(--ink);}
+h1{
+  font-size:2.65rem!important;
+  line-height:1.03!important;
+  letter-spacing:-.045em!important;
+  margin:.1rem 0 .55rem!important;
 }
-[data-testid="stFileUploader"]:hover {
-  border-color:#6e8143;
+h2{
+  font-size:1.34rem!important;
+  letter-spacing:-.025em!important;
 }
-[data-testid="stMetric"] {
-  background:linear-gradient(180deg,#121a24,#0f161f);
-  border:1px solid var(--line);
-  border-radius:14px;
-  padding:16px 18px;
+h3{font-size:1.03rem!important;}
+small,[data-testid="stCaptionContainer"],.stCaption{
+  color:var(--muted)!important;
 }
-[data-testid="stMetricValue"] {
-  color:var(--text);
-  font-size:1.8rem;
-  font-weight:800;
+[data-testid="stMarkdownContainer"] p{color:#dbe2e9;}
+code{
+  color:#e9f6ff!important;
+  background:#0a1119!important;
 }
-[data-testid="stMetricLabel"] {color:var(--muted);}
-.stButton > button, .stDownloadButton > button, [data-testid="stLinkButton"] a {
+
+/* Upload */
+[data-testid="stFileUploader"]{
+  background:linear-gradient(180deg,#101923 0%,#0c141c 100%)!important;
+  border:1px dashed #456078!important;
+  border-radius:18px!important;
+  padding:.45rem!important;
+  box-shadow:0 16px 50px rgba(0,0,0,.15);
+}
+[data-testid="stFileUploader"]:hover{border-color:#8bad5a!important;}
+[data-testid="stFileUploader"] section{
+  background:transparent!important;
+  border:0!important;
+}
+[data-testid="stFileUploaderFile"]{
+  background:#172432!important;
+  border:1px solid #293e53!important;
   border-radius:10px!important;
-  min-height:42px;
-  font-weight:800;
-  letter-spacing:.01em;
-  border:1px solid #334255!important;
 }
-.stButton > button[kind="primary"] {
-  background:var(--accent)!important;
-  color:#0b0f14!important;
-  border-color:var(--accent)!important;
+[data-testid="stFileUploaderFile"] *{color:#eef3f7!important;}
+
+/* Metrics */
+[data-testid="stMetric"]{
+  background:linear-gradient(180deg,#111b25,#0d151e)!important;
+  border:1px solid var(--line)!important;
+  border-radius:16px!important;
+  padding:15px 17px!important;
+  min-height:95px;
+  box-shadow:0 10px 35px rgba(0,0,0,.12);
 }
-.stButton > button:hover, .stDownloadButton > button:hover {
-  border-color:#708295!important;
+[data-testid="stMetricLabel"]{
+  color:var(--muted)!important;
+  font-weight:700!important;
+  letter-spacing:.02em;
 }
-[data-testid="stExpander"] {
-  background:#101720;
+[data-testid="stMetricValue"]{
+  color:var(--ink)!important;
+  font-size:1.95rem!important;
+  font-weight:900!important;
+  letter-spacing:-.035em!important;
+}
+
+/* Inputs */
+[data-testid="stTextInput"] input,
+[data-baseweb="select"]>div{
+  background:#0b121a!important;
+  color:var(--ink)!important;
+  border:1px solid var(--line2)!important;
+  border-radius:10px!important;
+  min-height:43px!important;
+}
+[data-testid="stTextInput"] input::placeholder{color:#697788!important;}
+[data-baseweb="popover"],[role="listbox"]{
+  background:#111a24!important;
+  color:var(--ink)!important;
+}
+
+/* Buttons */
+.stButton>button,.stDownloadButton>button,[data-testid="stLinkButton"] a{
+  border-radius:10px!important;
+  min-height:44px!important;
+  font-weight:850!important;
+  letter-spacing:.005em!important;
+  transition:all .14s ease!important;
+}
+.stButton>button[kind="primary"]{
+  background:var(--acid)!important;
+  color:#071008!important;
+  border:1px solid var(--acid)!important;
+  box-shadow:0 7px 26px rgba(200,255,54,.13)!important;
+}
+.stButton>button[kind="primary"] p{
+  color:#071008!important;
+}
+.stButton>button[kind="secondary"],
+.stDownloadButton>button{
+  background:#121c27!important;
+  color:var(--ink)!important;
+  border:1px solid #304559!important;
+}
+.stButton>button[kind="secondary"] p,
+.stDownloadButton>button p{
+  color:var(--ink)!important;
+}
+.stButton>button:hover,.stDownloadButton>button:hover{
+  transform:translateY(-1px);
+  border-color:#69809a!important;
+}
+.stButton>button[kind="primary"]:hover{
+  background:#d5ff62!important;
+  border-color:#d5ff62!important;
+}
+
+/* Bordered containers become dark cards */
+[data-testid="stVerticalBlockBorderWrapper"]{
+  background:linear-gradient(180deg,#101923,#0c141c)!important;
+  border:1px solid var(--line)!important;
+  border-radius:16px!important;
+  box-shadow:0 14px 40px rgba(0,0,0,.13)!important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]>div{
+  border-radius:16px!important;
+}
+
+/* Expanders */
+[data-testid="stExpander"]{
+  background:#0f1822!important;
   border:1px solid var(--line)!important;
   border-radius:12px!important;
+  overflow:hidden!important;
 }
-[data-testid="stDataFrame"] {
-  border:1px solid var(--line);
-  border-radius:12px;
-  overflow:hidden;
+[data-testid="stExpander"] summary{
+  color:var(--ink)!important;
+  font-weight:800!important;
 }
-[data-testid="stImage"] img {
-  border-radius:16px;
+[data-testid="stExpander"] svg{fill:var(--muted)!important;}
+
+/* Tables */
+[data-testid="stDataFrame"]{
+  border:1px solid var(--line)!important;
+  border-radius:14px!important;
+  overflow:hidden!important;
 }
-[data-testid="stTextInput"] input, [data-testid="stSelectbox"] > div > div {
-  background:#0d141c!important;
-  border-color:#334255!important;
-  color:var(--text)!important;
+
+/* Images */
+[data-testid="stImage"] img{
+  border-radius:16px!important;
+  border:1px solid #25384a!important;
+  box-shadow:0 18px 60px rgba(0,0,0,.26);
 }
-.ds-kicker {
-  color:var(--accent);
-  font-size:.78rem;
-  font-weight:900;
-  letter-spacing:.18em;
+
+/* Custom design classes */
+.ds-eyebrow{
+  color:var(--acid)!important;
+  font-size:.73rem;
+  font-weight:950;
   text-transform:uppercase;
-  margin-bottom:.45rem;
+  letter-spacing:.20em;
+  margin-bottom:.55rem;
 }
-.ds-sub {
-  color:var(--muted);
-  font-size:1rem;
-  max-width:850px;
-  margin-bottom:1.2rem;
+.ds-lede{
+  color:var(--muted)!important;
+  font-size:1.02rem;
+  max-width:980px;
+  margin:0 0 1.55rem;
 }
-.ds-shell {
-  background:linear-gradient(180deg,#111923,#0e151d);
-  border:1px solid var(--line);
-  border-radius:18px;
-  padding:18px;
-}
-.ds-section-title {
-  font-size:.78rem;
-  font-weight:900;
-  letter-spacing:.13em;
+.ds-step{
+  color:#91a4b7!important;
+  font-size:.72rem;
+  font-weight:950;
   text-transform:uppercase;
-  color:#9cafbf;
-  margin-bottom:.75rem;
+  letter-spacing:.16em;
+  margin:.2rem 0 .7rem;
 }
-.ds-chip {
+.ds-divider{
+  height:1px;
+  background:linear-gradient(90deg,var(--line),transparent);
+  margin:1.35rem 0 1.4rem;
+}
+.ds-chip{
   display:inline-flex;
   align-items:center;
-  gap:6px;
   padding:5px 9px;
+  margin:0 5px 6px 0;
   border-radius:999px;
   font-size:12px;
+  line-height:1;
   font-weight:900;
-  margin:0 5px 6px 0;
   border:1px solid transparent;
 }
-.ds-chip.good{background:#143126;color:#9ee8bb;border-color:#29583f}
-.ds-chip.mid{background:#352b15;color:#f8d886;border-color:#5b4821}
-.ds-chip.bad{background:#341a1d;color:#ffb0b0;border-color:#603036}
-.ds-chip.info{background:#152638;color:#b9d6ed;border-color:#284963}
-.ds-filename {
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-  word-break:break-word;
-  padding:11px 12px;
-  border-radius:10px;
-  background:#090e14;
-  border:1px solid #2b394a;
-  color:#dbe5ef;
-}
-.ds-result-head {
+.ds-chip.good{background:#133427;color:#a8f0c4;border-color:#2c674a}
+.ds-chip.mid{background:#3d2f13;color:#ffe098;border-color:#6c5225}
+.ds-chip.bad{background:#3b1b20;color:#ffb5ba;border-color:#6d333a}
+.ds-chip.info{background:#102a3b;color:#b5ddf8;border-color:#27536d}
+.ds-titleline{
   display:flex;
   align-items:flex-start;
   justify-content:space-between;
-  gap:12px;
+  gap:16px;
+  margin-bottom:12px;
 }
-.ds-material {
-  font-size:1.45rem;
-  font-weight:900;
-  letter-spacing:-.02em;
+.ds-material{
+  font-size:1.65rem;
+  line-height:1.05;
+  font-weight:950;
+  letter-spacing:-.035em;
+  color:var(--ink)!important;
 }
-.ds-small {color:var(--muted);font-size:.88rem;}
-.ds-rule {height:1px;background:var(--line);margin:1rem 0;}
+.ds-meta{
+  color:var(--muted)!important;
+  font-size:.88rem;
+  margin-top:5px;
+}
+.ds-filename{
+  color:#e9f5ff!important;
+  background:#070c12;
+  border:1px solid #2d4154;
+  border-radius:10px;
+  padding:11px 12px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:.94rem;
+  word-break:break-word;
+}
+.ds-label{
+  color:#93a8bb!important;
+  text-transform:uppercase;
+  letter-spacing:.13em;
+  font-size:.69rem;
+  font-weight:950;
+  margin:1rem 0 .45rem;
+}
+.ds-note{
+  color:var(--muted)!important;
+  background:#0b131c;
+  border:1px solid #223548;
+  border-radius:10px;
+  padding:10px 11px;
+  font-size:.87rem;
+}
+.ds-empty{
+  min-height:150px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  color:#788899!important;
+  border:1px dashed #31485d;
+  background:#0b131c;
+  border-radius:14px;
+}
+.ds-evidence{
+  display:grid;
+  grid-template-columns:1fr auto;
+  gap:8px 12px;
+  align-items:center;
+  margin:.35rem 0;
+}
+.ds-evidence span:first-child{color:#bcc6d0!important;font-size:.9rem;}
+.ds-evidence strong{color:var(--ink)!important;}
+.ds-statusline{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  margin:.25rem 0 .4rem;
+}
+
+/* Queue buttons: readable dark cards */
+div[data-testid="stVerticalBlockBorderWrapper"] .stButton>button[kind="secondary"]{
+  width:100%;
+  justify-content:flex-start!important;
+  text-align:left!important;
+  background:#101a24!important;
+  border:1px solid #293e52!important;
+  min-height:58px!important;
+  padding:.55rem .7rem!important;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] .stButton>button[kind="secondary"] p{
+  color:#edf3f8!important;
+  font-size:.84rem!important;
+  line-height:1.25!important;
+  white-space:normal!important;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] .stButton>button[kind="primary"]{
+  width:100%;
+  justify-content:flex-start!important;
+  text-align:left!important;
+  background:#1b2a12!important;
+  border:1px solid #66872e!important;
+  min-height:58px!important;
+  padding:.55rem .7rem!important;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] .stButton>button[kind="primary"] p{
+  color:#eaffbd!important;
+  font-size:.84rem!important;
+  line-height:1.25!important;
+  white-space:normal!important;
+}
+
+/* progress */
+[data-testid="stProgress"]>div>div{background:var(--acid)!important;}
+
+@media(max-width:1100px){
+  .block-container{padding:1.2rem!important;}
+  h1{font-size:2.05rem!important;}
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="ds-kicker">GENROSE · INTERNAL TOOL</div>', unsafe_allow_html=True)
+st.markdown('<div class="ds-eyebrow">GENROSE · INTERNAL IMAGE OPERATIONS</div>', unsafe_allow_html=True)
 st.title("Room Scene Analyzer")
 st.markdown(
-    '<div class="ds-sub">Drop a batch of manufacturer room scenes. The app reads the original filename first, '
-    'normalizes English/Italian room terms, matches the material + SKU, verifies against GENROSE references, '
-    'and only leans on Google Vision when the filename is weak.</div>',
+    '<div class="ds-lede">Upload manufacturer room scenes and get a clean proposed filename, material, SKU, and room type. '
+    'Filename intelligence runs first; GENROSE references and Google Vision only step in when needed.</div>',
     unsafe_allow_html=True
 )
-
 website_cache = load_website_cache()
 website_count = sum(1 for x in website_cache.get("materials", {}).values() if x.get("status") == "OK")
 
@@ -1416,7 +1606,7 @@ with st.sidebar:
     st.divider()
     st.caption("You should rarely need this panel after setup.")
 
-st.markdown('<div class="ds-section-title">01 · Add room scenes</div>', unsafe_allow_html=True)
+st.markdown('<div class="ds-step">01 · Add room scenes</div>', unsafe_allow_html=True)
 uploads = st.file_uploader(
     "Drop JPG / PNG / WEBP files here",
     type=["jpg", "jpeg", "png", "webp"],
@@ -1437,9 +1627,9 @@ pending = st.session_state.pending
 
 if pending and not st.session_state.results:
     st.markdown(
-        f'<div class="ds-shell"><div class="ds-section-title">02 · Analyze</div>'
+        f'<div class="ds-shell"><div class="ds-step">02 · Analyze</div>'
         f'<div style="font-size:1.15rem;font-weight:800">{len(pending)} images loaded</div>'
-        f'<div class="ds-small">Filename parsing runs first. Google Vision is enrichment/fallback, not the only matching method.</div></div>',
+        f'<div class="ds-meta">Filename parsing runs first. Google Vision is enrichment/fallback, not the only matching method.</div></div>',
         unsafe_allow_html=True
     )
     if not vision_ready():
@@ -1506,7 +1696,7 @@ for x in results:
 high = sum(x["analysis"]["material_confidence"] >= 90 and x["analysis"]["room_confidence"] >= 70 for x in results)
 review = len(results) - high
 
-st.markdown('<div class="ds-section-title">03 · Results</div>', unsafe_allow_html=True)
+st.markdown('<div class="ds-step">03 · Results</div>', unsafe_allow_html=True)
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Images", len(results))
 m2.metric("Ready", high)
@@ -1527,100 +1717,114 @@ if st.session_state.review_url:
     st.code(st.session_state.review_url)
     st.link_button("Open review page", st.session_state.review_url)
 
-st.divider()
-left, center, right = st.columns([1.0, 1.55, 1.1], gap="large")
+st.markdown('<div class="ds-divider"></div>', unsafe_allow_html=True)
+left, center, right = st.columns([0.95, 1.55, 1.05], gap="large")
 
 with left:
-    st.subheader("Queue")
-    q = st.text_input("Search", placeholder="filename, material, SKU, room")
-    for i, x in enumerate(results):
-        a = x["analysis"]
-        if q and norm(q) not in norm(x["name"] + " " + x["stone"] + " " + x["sku"] + " " + x["room"]):
-            continue
-        conf = a["material_confidence"]
-        icon = "🟢" if conf >= 90 and a["room_confidence"] >= 70 else "🟡" if conf >= 70 else "🔴"
-        if st.button(
-            f"{icon} {x['name']}\n{x['stone'] or 'Unknown'} · {x['room']} · {conf}%",
-            key=f"result_{i}",
-            use_container_width=True
-        ):
-            st.session_state.selected = i
-            st.rerun()
+    with st.container(border=True, height=720):
+        st.subheader("Queue")
+        q = st.text_input("Search scenes", placeholder="Search filename, material, SKU or room", label_visibility="collapsed")
+        for i, x in enumerate(results):
+            a = x["analysis"]
+            if q and norm(q) not in norm(x["name"] + " " + x["stone"] + " " + x["sku"] + " " + x["room"]):
+                continue
+            conf = a["material_confidence"]
+            icon = "●" if conf >= 90 and a["room_confidence"] >= 70 else "●"
+            label = f"{icon} {x['name']}\n{x['stone'] or 'Unknown material'} · {x['room']} · {conf}%"
+            if st.button(
+                label,
+                key=f"result_{i}",
+                use_container_width=True,
+                type="primary" if i == st.session_state.selected else "secondary"
+            ):
+                st.session_state.selected = i
+                st.rerun()
 
 idx = min(st.session_state.selected, len(results)-1)
 item = results[idx]
 analysis = item["analysis"]
 
 with center:
-    st.subheader("Preview")
-    st.image(Image.open(io.BytesIO(item["bytes"])), use_container_width=True)
-    st.caption(item["name"])
-    cls = "good" if analysis["material_confidence"] >= 90 else "mid" if analysis["material_confidence"] >= 70 else "bad"
-    st.markdown(
-        f'<span class="ds-chip {cls}">Material {analysis["material_confidence"]}%</span>'
-        f'<span class="ds-chip info">Room {analysis["room_confidence"]}%</span>'
-        f'<span class="ds-chip info">{html.escape(analysis["material_method"])}</span>',
-        unsafe_allow_html=True
-    )
+    with st.container(border=True, height=720):
+        st.subheader("Preview")
+        st.image(Image.open(io.BytesIO(item["bytes"])), use_container_width=True)
+        st.caption(item["name"])
+        cls = "good" if analysis["material_confidence"] >= 90 else "mid" if analysis["material_confidence"] >= 70 else "bad"
+        st.markdown(
+            f'<div class="ds-statusline">'
+            f'<span class="ds-chip {cls}">Material {analysis["material_confidence"]}%</span>'
+            f'<span class="ds-chip info">Room {analysis["room_confidence"]}%</span>'
+            f'<span class="ds-chip info">{html.escape(analysis["material_method"])}</span>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
 with right:
-    st.subheader("Match")
-    st.markdown(
-        f'<div class="ds-result-head"><div>'
-        f'<div class="ds-material">{html.escape(item["stone"] or "Unknown material")}</div>'
-        f'<div class="ds-small">SKU · {html.escape(item["sku"] or "NEED-SKU")} &nbsp;&nbsp; Room · {html.escape(item["room"])}</div>'
-        f'</div></div>',
-        unsafe_allow_html=True
-    )
-    st.markdown('<div class="ds-rule"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="ds-section-title">New filename</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="ds-filename">{html.escape(item["new_name"])}</div>', unsafe_allow_html=True)
+    with st.container(border=True, height=720):
+        st.subheader("Match")
+        st.markdown(
+            f'<div class="ds-titleline"><div>'
+            f'<div class="ds-material">{html.escape(item["stone"] or "Unknown material")}</div>'
+            f'<div class="ds-meta">SKU · {html.escape(item["sku"] or "NEED-SKU")} &nbsp;&nbsp; Room · {html.escape(item["room"])}</div>'
+            f'</div></div>',
+            unsafe_allow_html=True
+        )
+        st.markdown('<div class="ds-divider"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="ds-label">New filename</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="ds-filename">{html.escape(item["new_name"])}</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="ds-rule"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="ds-section-title">Why this match</div>', unsafe_allow_html=True)
-    st.write(f"Filename material evidence: **{analysis['filename_material_score']}%**")
-    st.write(f"Google Vision text/web evidence: **{analysis['vision_text_score']}%**")
-    if analysis["visual_score"]:
-        st.write(f"Google visual similarity: **{analysis['visual_score']}%**")
-    st.write("Website verification: **YES**" if analysis["website_verified"] else "Website verification: **NO / not cached**")
-    st.caption(analysis["room_method"])
+        st.markdown('<div class="ds-divider"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="ds-label">Why this match</div>', unsafe_allow_html=True)
+        evidence_html = (
+            '<div class="ds-evidence"><span>Filename evidence</span><strong>' + str(analysis["filename_material_score"]) + '%</strong></div>'
+            '<div class="ds-evidence"><span>Google Vision evidence</span><strong>' + str(analysis["vision_text_score"]) + '%</strong></div>'
+        )
+        if analysis["visual_score"]:
+            evidence_html += '<div class="ds-evidence"><span>Visual similarity</span><strong>' + str(analysis["visual_score"]) + '%</strong></div>'
+        evidence_html += (
+            '<div class="ds-evidence"><span>GENROSE reference</span><strong>' +
+            ('Verified' if analysis["website_verified"] else 'Not cached') + '</strong></div>'
+        )
+        st.markdown(evidence_html, unsafe_allow_html=True)
+        st.markdown(f'<div class="ds-note">{html.escape(analysis["room_method"])}</div>', unsafe_allow_html=True)
 
-    st.markdown("**Website reference**")
-    sw = website_reference_bytes(item["sku"])
-    if sw:
-        st.image(Image.open(io.BytesIO(sw)), width=240)
-    else:
-        st.caption("No cached website reference for this material.")
-    web_entry = website_entry_for_sku(item["sku"])
-    if web_entry.get("page_url"):
-        st.link_button("Open GENROSE material page", web_entry["page_url"])
+        st.markdown("**Website reference**")
+        sw = website_reference_bytes(item["sku"])
+        if sw:
+            st.image(Image.open(io.BytesIO(sw)), width=240)
+        else:
+            st.markdown('<div class="ds-empty">No GENROSE reference image cached for this material yet.</div>', unsafe_allow_html=True)
+        web_entry = website_entry_for_sku(item["sku"])
+        if web_entry.get("page_url"):
+            st.link_button("Open GENROSE material page", web_entry["page_url"])
 
-    with st.expander("Top material candidates", expanded=True):
-        for c in analysis["material_candidates"][:6]:
-            st.write(
-                f"**{c['stone']}** · `{c['sku']}` — {int(round(c['confidence']*100))}%"
-            )
-            st.caption(
-                f"filename {int(round(c['filename']*100))}% · "
-                f"Vision text {int(round(c['vision_text']*100))}% · "
-                f"visual {int(round(c['visual']*100))}% · {c['method']}"
-            )
+        with st.expander("Alternate material matches", expanded=False):
+            for c in analysis["material_candidates"][:6]:
+                st.write(
+                    f"**{c['stone']}** · `{c['sku']}` — {int(round(c['confidence']*100))}%"
+                )
+                st.caption(
+                    f"filename {int(round(c['filename']*100))}% · "
+                    f"Vision text {int(round(c['vision_text']*100))}% · "
+                    f"visual {int(round(c['visual']*100))}% · {c['method']}"
+                )
 
-    with st.expander("Google Vision evidence"):
-        v = analysis["vision"]
-        if v.get("error"):
-            st.warning("Google Cloud Vision did not run for this image. Filename + room-name analysis was preserved.")
-            st.code(v["error"][:800])
-        st.write("**Labels:**", ", ".join(v.get("labels", [])[:15]) or "—")
-        st.write("**Web entities:**", ", ".join(v.get("web_entities", [])[:15]) or "—")
-        if v.get("web_pages"):
-            st.write("**Matching web pages:**")
-            for u in v["web_pages"][:5]:
-                st.caption(u)
-        if v.get("text"):
-            st.text(v["text"][:1200])
+        with st.expander("Diagnostics · Google Vision", expanded=False):
+            v = analysis["vision"]
+            if v.get("error"):
+                st.warning("Google Cloud Vision did not run for this image. Filename + room-name analysis was preserved.")
+                st.code(v["error"][:500])
+            st.write("**Labels:**", ", ".join(v.get("labels", [])[:15]) or "—")
+            st.write("**Web entities:**", ", ".join(v.get("web_entities", [])[:15]) or "—")
+            if v.get("web_pages"):
+                st.write("**Matching web pages:**")
+                for u in v["web_pages"][:5]:
+                    st.caption(u)
+            if v.get("text"):
+                st.text(v["text"][:1200])
 
-st.divider()
+st.markdown('<div class="ds-divider"></div>', unsafe_allow_html=True)
+st.markdown('<div class="ds-step">04 · Export</div>', unsafe_allow_html=True)
 table = pd.DataFrame([{
     "Old Filename": x["name"],
     "New Filename": x["new_name"],

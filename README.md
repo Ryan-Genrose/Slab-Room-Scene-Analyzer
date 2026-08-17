@@ -1,4 +1,4 @@
-# GENROSE Room Scene Analyzer v0.5.2
+# GENROSE Room Scene Analyzer v0.6.0
 
 ## Daily workflow
 1. Drop a batch of room-scene images.
@@ -29,12 +29,16 @@ Example:
 See `DEPLOYMENT_GUIDE.md`.
 
 
-## v0.5.2 critical fix
+## v0.6.0 critical fix
 A Google Cloud Vision 403/API-disabled error no longer wipes out the filename parser.
 Filename material matching and English/Italian room detection always run first and
 remain visible even if Google Cloud fails. Cloud Vision is now enrichment/fallback,
 not a single point of failure.
 
 
-## v0.5.2 UI pass
+## v0.6.0 UI pass
 Redesigned the daily interface: collapsed admin sidebar, cleaner dark workspace, compact summary cards, cleaner queue/preview/match layout, and reduced diagnostic clutter.
+
+
+## v0.6.0 visual redesign
+Full readability/design pass: consistent dark cards, readable queue items, scrollable review workspace, high-contrast controls, polished evidence presentation, and diagnostics kept out of the primary workflow.
