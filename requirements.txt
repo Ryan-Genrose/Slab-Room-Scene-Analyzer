@@ -1,0 +1,8 @@
+streamlit>=1.41,<2
+pandas>=2.2
+Pillow>=10.0
+requests>=2.32
+beautifulsoup4>=4.12
+google-cloud-vision>=3.10
+google-cloud-storage>=2.18
+google-auth>=2.35
