@@ -46,74 +46,45 @@ GENROSE_INDEX = "https://www.genrose.com/Products/natural-stone-slabs/"
 REVIEW_EMAIL = "marketing@genrose.com"
 
 ROOM_TYPES = [
-    "Kitchen", "KitchenCounter", "KitchenIsland", "LivingRoom", "Bathroom", "PowderRoom",
-    "PrimaryBathroom", "Shower", "Vanity", "Fireplace", "MudRoom", "Entryway", "Foyer",
-    "DiningRoom", "Bar", "LaundryRoom", "Bedroom", "Office", "FeatureWall", "Exterior", "Other"
+    "Kitchen", "KitchenCounter", "KitchenIsland",
+    "LivingRoom", "DiningRoom", "Bedroom",
+    "Bathroom", "PowderRoom", "PrimaryBathroom", "Shower", "Vanity",
+    "Reception", "Lobby", "Office", "ConferenceRoom",
+    "Showroom", "Retail", "Restaurant", "Bar",
+    "Fireplace", "MudRoom", "Entryway", "Foyer", "Hallway",
+    "LaundryRoom", "FeatureWall", "Exterior", "Other"
 ]
 
 # Filename room-language aliases. These are intentionally explicit rather than translating
 # the entire filename because many stone names are themselves Italian.
 ROOM_ALIASES = {
-    "Kitchen": [
-        "kitchen", "cucina", "cucine"
-    ],
-    "KitchenCounter": [
-        "kitchen counter", "kitchen countertop", "countertop", "counter top", "piano cucina"
-    ],
-    "KitchenIsland": [
-        "kitchen island", "island", "isola cucina", "isola"
-    ],
-    "LivingRoom": [
-        "living room", "family room", "soggiorno", "salotto", "zona giorno"
-    ],
-    "Bathroom": [
-        "bathroom", "bath", "bagno", "bagni", "stanza da bagno", "vasca"
-    ],
-    "PowderRoom": [
-        "powder room", "powderroom", "half bath", "toilette", "bagno ospiti"
-    ],
-    "PrimaryBathroom": [
-        "primary bathroom", "master bathroom", "primary bath", "master bath", "bagno padronale"
-    ],
-    "Shower": [
-        "shower", "doccia", "box doccia"
-    ],
-    "Vanity": [
-        "vanity", "bath vanity", "mobile bagno", "lavabo"
-    ],
-    "Fireplace": [
-        "fireplace", "hearth", "mantel", "camino", "caminetto"
-    ],
-    "MudRoom": [
-        "mudroom", "mud room", "ingresso di servizio"
-    ],
-    "Entryway": [
-        "entryway", "entry way", "entrance", "ingresso"
-    ],
-    "Foyer": [
-        "foyer", "atrio"
-    ],
-    "DiningRoom": [
-        "dining room", "dining", "sala da pranzo"
-    ],
-    "Bar": [
-        "wet bar", "home bar", "bar"
-    ],
-    "LaundryRoom": [
-        "laundry room", "laundry", "lavanderia"
-    ],
-    "Bedroom": [
-        "bedroom", "camera da letto", "camera letto"
-    ],
-    "Office": [
-        "office", "home office", "ufficio", "studio"
-    ],
-    "FeatureWall": [
-        "feature wall", "accent wall", "wall cladding", "parete", "rivestimento parete"
-    ],
-    "Exterior": [
-        "exterior", "outdoor", "patio", "facade", "facciata", "esterno", "esterni"
-    ],
+    "Kitchen": ["kitchen", "cucina", "cucine"],
+    "KitchenCounter": ["kitchen counter", "kitchen countertop", "countertop", "counter top", "piano cucina"],
+    "KitchenIsland": ["kitchen island", "island", "isola cucina", "isola"],
+    "LivingRoom": ["living room", "family room", "soggiorno", "salotto", "zona giorno"],
+    "DiningRoom": ["dining room", "dining", "sala da pranzo"],
+    "Bedroom": ["bedroom", "camera da letto", "camera letto"],
+    "Bathroom": ["bathroom", "bath", "bagno", "bagni", "stanza da bagno", "vasca"],
+    "PowderRoom": ["powder room", "powderroom", "half bath", "toilette", "bagno ospiti"],
+    "PrimaryBathroom": ["primary bathroom", "master bathroom", "primary bath", "master bath", "bagno padronale"],
+    "Shower": ["shower", "doccia", "box doccia"],
+    "Vanity": ["vanity", "bath vanity", "mobile bagno", "lavabo"],
+    "Reception": ["reception", "reception desk", "front desk", "frontdesk", "concierge", "reception area", "reception counter"],
+    "Lobby": ["lobby", "hotel lobby", "waiting area", "waiting room", "reception lobby"],
+    "Office": ["office", "home office", "ufficio", "studio"],
+    "ConferenceRoom": ["conference room", "meeting room", "boardroom", "sala riunioni"],
+    "Showroom": ["showroom", "display room", "display area", "gallery showroom"],
+    "Retail": ["retail", "store", "shop", "boutique", "negozio"],
+    "Restaurant": ["restaurant", "ristorante", "dining hall"],
+    "Bar": ["wet bar", "home bar", "bar", "cocktail bar"],
+    "Fireplace": ["fireplace", "hearth", "mantel", "camino", "caminetto"],
+    "MudRoom": ["mudroom", "mud room", "ingresso di servizio"],
+    "Entryway": ["entryway", "entry way", "entrance", "ingresso"],
+    "Foyer": ["foyer", "atrio"],
+    "Hallway": ["hallway", "corridor", "corridoio"],
+    "LaundryRoom": ["laundry room", "laundry", "lavanderia"],
+    "FeatureWall": ["feature wall", "accent wall", "wall cladding", "parete", "rivestimento parete"],
+    "Exterior": ["exterior", "outdoor", "patio", "facade", "facciata", "esterno", "esterni"],
 }
 
 FILENAME_NOISE = {
@@ -205,6 +176,154 @@ def detect_room_from_text(text):
         score, room, alias = matches[0]
         return {"room": room, "score": score, "matched_term": alias}
     return {"room": "Other", "score": .18, "matched_term": ""}
+
+
+def _phrase_hits(text, phrases):
+    x = " " + norm(text) + " "
+    return sum(1 for p in phrases if (" " + norm(p) + " ") in x)
+
+def classify_room_from_vision(vision_data):
+    """Classify the semantic room/space from Google Vision evidence.
+
+    Uses labels, web best guesses/entities, localized objects, and OCR. Scores
+    are heuristic evidence weights, then converted into a conservative UI
+    confidence. This is intentionally separate from exact material recognition.
+    """
+    labels = vision_data.get("labels", [])
+    web = vision_data.get("web_entities", [])
+    best = vision_data.get("best_guess", [])
+    objects = vision_data.get("objects", [])
+    text = vision_data.get("text", "")
+    evidence = " ".join(labels + web + best + objects + [text])
+    e = norm(evidence)
+
+    scores = {r: 0.0 for r in ROOM_TYPES if r != "Other"}
+    reasons = {r: [] for r in scores}
+
+    def add(room, points, reason):
+        scores[room] = scores.get(room, 0.0) + points
+        reasons.setdefault(room, []).append(reason)
+
+    # Strong scene labels.
+    strong = {
+        "Reception": ["reception", "reception desk", "front desk", "concierge"],
+        "Lobby": ["lobby", "waiting area", "waiting room"],
+        "Kitchen": ["kitchen"],
+        "KitchenIsland": ["kitchen island"],
+        "KitchenCounter": ["kitchen counter", "countertop"],
+        "LivingRoom": ["living room", "family room"],
+        "DiningRoom": ["dining room"],
+        "Bedroom": ["bedroom"],
+        "Bathroom": ["bathroom"],
+        "PowderRoom": ["powder room"],
+        "PrimaryBathroom": ["primary bathroom", "master bathroom"],
+        "Shower": ["shower"],
+        "Office": ["office"],
+        "ConferenceRoom": ["conference room", "meeting room", "boardroom"],
+        "Showroom": ["showroom"],
+        "Retail": ["retail store", "store interior", "boutique"],
+        "Restaurant": ["restaurant"],
+        "Bar": ["bar interior", "cocktail bar", "pub"],
+        "MudRoom": ["mudroom", "mud room"],
+        "LaundryRoom": ["laundry room"],
+        "Hallway": ["hallway", "corridor"],
+        "Foyer": ["foyer"],
+        "Entryway": ["entryway", "entrance hall"],
+        "Exterior": ["exterior", "outdoor", "facade"],
+    }
+    for room, phrases in strong.items():
+        hits = _phrase_hits(e, phrases)
+        if hits:
+            add(room, 6.0 + min(hits - 1, 2), "strong scene label")
+
+    # Distinctive object cues.
+    if _phrase_hits(e, ["bed", "mattress", "bed frame"]):
+        add("Bedroom", 5.5, "bed detected")
+    if _phrase_hits(e, ["toilet", "bathtub", "bath tub"]):
+        add("Bathroom", 5.5, "bath fixture detected")
+    if _phrase_hits(e, ["shower", "showerhead"]):
+        add("Shower", 5.5, "shower fixture detected")
+        add("Bathroom", 2.0, "bathroom fixture detected")
+    if _phrase_hits(e, ["stove", "oven", "refrigerator", "kitchen appliance"]):
+        add("Kitchen", 5.5, "kitchen appliance detected")
+    if _phrase_hits(e, ["sofa", "couch"]):
+        add("LivingRoom", 4.5, "sofa/couch detected")
+    if _phrase_hits(e, ["washing machine", "washer", "dryer"]):
+        add("LaundryRoom", 5.5, "laundry appliance detected")
+    if _phrase_hits(e, ["fireplace", "hearth"]):
+        add("Fireplace", 6.0, "fireplace detected")
+    if _phrase_hits(e, ["display case", "display cabinet", "merchandise"]):
+        add("Retail", 4.0, "retail/display cue")
+        add("Showroom", 3.0, "display cue")
+
+    # Reception/front desk inference. Vision often says "desk/counter/interior"
+    # rather than literally "reception desk", so score combinations.
+    front_counter = _phrase_hits(e, ["desk", "counter", "countertop", "front desk", "reception desk"])
+    commercial = _phrase_hits(e, [
+        "hotel", "commercial building", "office building", "business",
+        "public space", "lobby", "waiting room", "concierge", "reception"
+    ])
+    waiting = _phrase_hits(e, ["waiting", "seating", "chair", "sofa"])
+    workstation = _phrase_hits(e, ["computer", "monitor", "keyboard", "workstation", "office chair"])
+
+    if front_counter:
+        add("Reception", 1.8, "front counter/desk cue")
+        add("Office", 1.0, "desk cue")
+    if front_counter and commercial:
+        add("Reception", 5.5, "counter + commercial/lobby cues")
+    if front_counter and commercial and waiting:
+        add("Reception", 2.0, "counter + waiting/seating cues")
+    if _phrase_hits(e, ["hotel"]) and front_counter:
+        add("Reception", 4.0, "hotel + desk/counter")
+        add("Lobby", 2.0, "hotel context")
+    if _phrase_hits(e, ["lobby"]) and front_counter:
+        add("Reception", 4.5, "lobby + desk/counter")
+    if _phrase_hits(e, ["lobby"]) and not front_counter:
+        add("Lobby", 4.0, "lobby without front desk")
+    if workstation >= 2 and commercial == 0:
+        add("Office", 4.0, "workstation cues")
+    if workstation >= 2 and not front_counter:
+        add("Office", 2.0, "office workstation")
+
+    # Dining / restaurant / bar.
+    table = _phrase_hits(e, ["dining table", "table"])
+    chairs = _phrase_hits(e, ["chair", "chairs", "seating"])
+    if _phrase_hits(e, ["restaurant", "food service"]) and table:
+        add("Restaurant", 5.0, "restaurant + tables")
+    elif table and chairs:
+        add("DiningRoom", 2.2, "table + seating")
+    if _phrase_hits(e, ["bar stool", "barstool"]):
+        add("Bar", 3.5, "bar stools")
+        add("KitchenIsland", 1.0, "counter seating")
+
+    # Counter-only commercial scenes should not become kitchens automatically.
+    if front_counter and commercial and not _phrase_hits(e, ["stove", "oven", "refrigerator", "kitchen"]):
+        scores["KitchenCounter"] *= 0.35
+        scores["Kitchen"] *= 0.35
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    top_room, top_score = ranked[0] if ranked else ("Other", 0.0)
+    second = ranked[1][1] if len(ranked) > 1 else 0.0
+
+    if top_score <= 0:
+        return {"room": "Other", "score": .22, "reason": "No strong room cues", "candidates": []}
+
+    margin = max(0.0, top_score - second)
+    confidence = min(.96, .50 + min(top_score, 10) * .035 + min(margin, 5) * .03)
+    if top_score < 3:
+        confidence = min(confidence, .63)
+
+    candidates = [
+        {"room": room, "weight": score, "reasons": reasons.get(room, [])}
+        for room, score in ranked[:4] if score > 0
+    ]
+    return {
+        "room": top_room,
+        "score": confidence,
+        "reason": "; ".join(reasons.get(top_room, [])[:3]) or "Vision scene cues",
+        "candidates": candidates,
+    }
+
 
 def token_material_score(clean_text, material_name):
     a = strip_room_words(clean_text)
@@ -308,7 +427,7 @@ def run_google_vision(image_bytes):
     """
     if not vision_ready():
         return {
-            "labels": [], "web_entities": [], "web_pages": [], "text": "",
+            "labels": [], "web_entities": [], "best_guess": [], "web_pages": [], "objects": [], "text": "",
             "error": "Vision not configured"
         }
 
@@ -316,33 +435,38 @@ def run_google_vision(image_bytes):
         client = image_client()
         image = vision.Image(content=image_bytes)
         features = [
-            vision.Feature(type_=vision.Feature.Type.LABEL_DETECTION, max_results=20),
-            vision.Feature(type_=vision.Feature.Type.WEB_DETECTION, max_results=20),
-            vision.Feature(type_=vision.Feature.Type.TEXT_DETECTION, max_results=5),
+            vision.Feature(type_=vision.Feature.Type.LABEL_DETECTION, max_results=30),
+            vision.Feature(type_=vision.Feature.Type.WEB_DETECTION, max_results=25),
+            vision.Feature(type_=vision.Feature.Type.OBJECT_LOCALIZATION, max_results=30),
+            vision.Feature(type_=vision.Feature.Type.TEXT_DETECTION, max_results=8),
         ]
         req = vision.AnnotateImageRequest(image=image, features=features)
         resp = client.batch_annotate_images(requests=[req]).responses[0]
 
         if resp.error.message:
             return {
-                "labels": [], "web_entities": [], "web_pages": [], "text": "",
+                "labels": [], "web_entities": [], "best_guess": [], "web_pages": [], "objects": [], "text": "",
                 "error": resp.error.message
             }
 
         labels = [x.description for x in resp.label_annotations]
         web_entities = [x.description for x in resp.web_detection.web_entities if x.description]
+        best_guess = [x.label for x in resp.web_detection.best_guess_labels if x.label]
         web_pages = [x.url for x in resp.web_detection.pages_with_matching_images if x.url][:10]
+        objects = [x.name for x in resp.localized_object_annotations if x.name]
         text = resp.text_annotations[0].description if resp.text_annotations else ""
         return {
             "labels": labels,
             "web_entities": web_entities,
+            "best_guess": best_guess,
             "web_pages": web_pages,
+            "objects": objects,
             "text": text,
             "error": ""
         }
     except Exception as e:
         return {
-            "labels": [], "web_entities": [], "web_pages": [], "text": "",
+            "labels": [], "web_entities": [], "best_guess": [], "web_pages": [], "objects": [], "text": "",
             "error": str(e)
         }
 
@@ -731,60 +855,87 @@ def candidate_by_stone(candidates, stone):
     return None
 
 def combine_material_evidence(filename_candidates, web_candidates, product_results, website_cache):
-    # Build a union keyed by SKU.
+    """Conservative material ranking.
+
+    Rules:
+    - Strong filename match wins.
+    - Medium filename match can be strengthened by website verification and/or Product Search.
+    - Product Search may provide a fallback when filename evidence is weak.
+    - Generic Google Vision labels/web entities/OCR may only support an existing candidate.
+      They can NEVER create a material identification by themselves.
+    - If evidence is not good enough, return Needs Review instead of inventing a slab.
+    """
     union = {}
+
     for c in filename_candidates:
         union.setdefault(c["sku"], {
             "stone": c["stone"], "sku": c["sku"], "source_name": c["source_name"],
             "filename": 0.0, "vision_text": 0.0, "visual": 0.0
         })
-        union[c["sku"]]["filename"] = max(union[c["sku"]]["filename"], c["score"])
-    for c in web_candidates:
-        union.setdefault(c["sku"], {
-            "stone": c["stone"], "sku": c["sku"], "source_name": c["source_name"],
-            "filename": 0.0, "vision_text": 0.0, "visual": 0.0
-        })
-        union[c["sku"]]["vision_text"] = max(union[c["sku"]]["vision_text"], c["score"])
+        union[c["sku"]]["filename"] = max(union[c["sku"]]["filename"], float(c["score"]))
+
+    # Vision text evidence may only attach to SKUs that were already proposed by
+    # filename or visual Product Search. Do not let generic Vision create a new SKU.
+    web_by_sku = {c["sku"]: c for c in web_candidates}
+
     for c in product_results:
         union.setdefault(c["sku"], {
             "stone": c["stone"], "sku": c["sku"], "source_name": c["source_name"],
             "filename": 0.0, "vision_text": 0.0, "visual": 0.0
         })
-        union[c["sku"]]["visual"] = max(union[c["sku"]]["visual"], c["score"])
+        union[c["sku"]]["visual"] = max(union[c["sku"]]["visual"], float(c["score"]))
+
+    for sku, x in union.items():
+        if sku in web_by_sku:
+            x["vision_text"] = float(web_by_sku[sku]["score"])
 
     results = []
     website_materials = website_cache.get("materials", {})
+
     for sku, x in union.items():
         f = x["filename"]
         vt = x["vision_text"]
         vis = x["visual"]
         web_verified = website_materials.get(str(sku), {}).get("status") == "OK"
 
-        # Hierarchy:
-        # filename is authoritative when strong;
-        # website confirms canonical product/SKU;
-        # Product Search is a fallback/secondary check;
-        # Vision web labels/OCR are last-ditch textual evidence.
-        if f >= .93:
-            final = .88 * f + (.06 if web_verified else 0) + .06 * vt
-            method = "Filename + website verification" if web_verified else "Filename"
+        # Strong filename: treat as authoritative.
+        if f >= .90:
+            final = min(.995, .92 * f + (.05 if web_verified else 0) + .03 * min(vt, .9))
+            method = "Filename"
+            if web_verified:
+                method += " + GENROSE verification"
             if vis >= .55:
-                final = min(.995, final + .03)
+                final = min(.995, final + .02)
                 method += " + visual confirmation"
+
+        # Medium filename: require corroboration for a strong result.
         elif f >= .70:
-            if vis > 0:
-                final = .56 * f + .32 * vis + .07 * vt + (.05 if web_verified else 0)
-                method = "Filename + Google visual"
+            if vis >= .55:
+                final = min(.94, .62 * f + .30 * vis + (.06 if web_verified else 0) + .02 * min(vt, .9))
+                method = "Filename + Product Search"
+                if web_verified:
+                    method += " + GENROSE verification"
+            elif web_verified:
+                final = min(.89, .86 * f + .08 + .03 * min(vt, .9))
+                method = "Filename + GENROSE verification"
             else:
-                final = .78 * f + .14 * vt + (.08 if web_verified else 0)
-                method = "Filename + Google Vision clues"
+                final = min(.79, f)
+                method = "Filename · review recommended"
+
+        # Weak filename: Product Search can suggest, but must be genuinely strong.
         else:
-            if vis > 0:
-                final = .72 * vis + .20 * vt + .08 * f
-                method = "Google visual fallback"
+            if vis >= .82:
+                final = min(.90, .88 * vis + .04 * f + (.04 if web_verified else 0))
+                method = "Product Search fallback"
+                if web_verified:
+                    method += " + GENROSE verification"
+            elif vis >= .68:
+                final = min(.76, .82 * vis + .06 * f)
+                method = "Product Search candidate · review required"
             else:
-                final = max(.62 * vt + .18 * f, f)
-                method = "Google Vision fallback"
+                # Do not turn vague Vision terms into "Red", "White", etc.
+                final = min(.49, max(f, vis * .60))
+                method = "Insufficient material evidence"
 
         results.append({
             **x,
@@ -802,16 +953,14 @@ def analyze_image(filename, image_bytes):
 
     # Cloud Vision is intentionally called for every analyzed image.
     vision_data = run_google_vision(image_bytes)
-    vision_room = detect_room_from_text(
-        " ".join(vision_data.get("labels", []) + vision_data.get("web_entities", []) + [vision_data.get("text", "")])
-    )
+    vision_room = classify_room_from_vision(vision_data)
     vision_materials = vision_text_material_candidates(vision_data, 8)
 
     top_filename = filename_materials[0]["score"] if filename_materials else 0
-    # Visual product matching is expensive/weak on full room scenes, so use it as fallback,
-    # or as a confirmation when filename material evidence isn't excellent.
+    # Product Search is the only image-based material fallback.
+    # Generic Vision labels/web entities are never allowed to name a slab.
     product_results = []
-    if top_filename < .93 and product_search_ready():
+    if top_filename < .90 and product_search_ready():
         try:
             product_results = run_product_search(image_bytes, 8)
         except Exception as e:
@@ -826,19 +975,34 @@ def analyze_image(filename, image_bytes):
         "filename": 0, "vision_text": 0, "visual": 0, "website_verified": False
     }
 
-    # Room hierarchy: filename first, Vision only if absent.
+    # Never invent a material when the evidence is weak.
+    # Below 60% the final result is explicitly Needs Review / UnknownMaterial,
+    # while candidates remain visible for a human to choose from.
+    if best.get("confidence", 0) < .60:
+        best = {
+            **best,
+            "stone": "",
+            "sku": "",
+            "method": "Needs Review · insufficient material evidence"
+        }
+
+    # Room hierarchy: explicit filename room terms win. If the filename has
+    # no useful room term, use a weighted Google Vision scene classifier.
     if filename_room["room"] != "Other":
         room = filename_room["room"]
         room_conf = filename_room["score"]
         room_method = f'Filename / translated term: "{filename_room["matched_term"]}"'
+        room_candidates = [{"room": room, "weight": 10.0, "reasons": ["filename term"]}]
     elif vision_room["room"] != "Other":
         room = vision_room["room"]
-        room_conf = min(.91, max(.68, vision_room["score"] * .88))
-        room_method = "Google Vision room clues"
+        room_conf = vision_room["score"]
+        room_method = "Google Vision scene classifier · " + vision_room.get("reason", "scene cues")
+        room_candidates = vision_room.get("candidates", [])
     else:
         room = "Other"
         room_conf = .22
         room_method = "No confident room clue"
+        room_candidates = []
 
     return {
         "stone": best["stone"],
@@ -852,6 +1016,7 @@ def analyze_image(filename, image_bytes):
         "room": room,
         "room_confidence": int(round(room_conf * 100)),
         "room_method": room_method,
+        "room_candidates": room_candidates,
         "material_candidates": material_ranked,
         "vision": vision_data,
     }
@@ -1549,6 +1714,8 @@ st.markdown(
     'Filename intelligence runs first; GENROSE references and Google Vision only step in when needed.</div>',
     unsafe_allow_html=True
 )
+
+st.caption("Material rule: filename first. Google Vision helps classify the room; Product Search only suggests a slab when filename evidence is weak. Low-confidence slab matches are left as Needs Review.")
 website_cache = load_website_cache()
 website_count = sum(1 for x in website_cache.get("materials", {}).values() if x.get("status") == "OK")
 
@@ -1646,7 +1813,7 @@ if pending and not st.session_state.results:
                     "stone": "", "sku": "", "material_confidence": 0, "material_method": f"ERROR: {e}",
                     "filename_material_score": 0, "vision_text_score": 0, "visual_score": 0,
                     "website_verified": False, "room": "Other", "room_confidence": 0,
-                    "room_method": "Error", "material_candidates": [], "vision": {"error": str(e)}
+                    "room_method": "Error", "room_candidates": [], "material_candidates": [], "vision": {"error": str(e)}
                 }
 
             new_name = proposed_filename(
@@ -1693,7 +1860,7 @@ for x in results:
         base += f"-{seen[key]:02d}"
     x["new_name"] = safe_filename(base) + x["ext"]
 
-high = sum(x["analysis"]["material_confidence"] >= 90 and x["analysis"]["room_confidence"] >= 70 for x in results)
+high = sum(x["analysis"]["material_confidence"] >= 90 and x["analysis"]["room_confidence"] >= 70 and x["stone"] and x["sku"] for x in results)
 review = len(results) - high
 
 st.markdown('<div class="ds-step">03 · Results</div>', unsafe_allow_html=True)
@@ -1730,7 +1897,7 @@ with left:
                 continue
             conf = a["material_confidence"]
             icon = "●" if conf >= 90 and a["room_confidence"] >= 70 else "●"
-            label = f"{icon} {x['name']}\n{x['stone'] or 'Unknown material'} · {x['room']} · {conf}%"
+            label = f"{icon} {x['name']}\n{x['stone'] or 'Needs Review'} · {x['room']} · {conf}%"
             if st.button(
                 label,
                 key=f"result_{i}",
@@ -1764,7 +1931,7 @@ with right:
         st.subheader("Match")
         st.markdown(
             f'<div class="ds-titleline"><div>'
-            f'<div class="ds-material">{html.escape(item["stone"] or "Unknown material")}</div>'
+            f'<div class="ds-material">{html.escape(item["stone"] or "Needs Review")}</div>'
             f'<div class="ds-meta">SKU · {html.escape(item["sku"] or "NEED-SKU")} &nbsp;&nbsp; Room · {html.escape(item["room"])}</div>'
             f'</div></div>',
             unsafe_allow_html=True
@@ -1787,6 +1954,12 @@ with right:
         )
         st.markdown(evidence_html, unsafe_allow_html=True)
         st.markdown(f'<div class="ds-note">{html.escape(analysis["room_method"])}</div>', unsafe_allow_html=True)
+        if analysis.get("room_candidates"):
+            with st.expander("Room-type candidates", expanded=False):
+                for rc in analysis["room_candidates"][:4]:
+                    st.write(f"**{rc['room']}** · evidence weight {rc.get('weight', 0):.1f}")
+                    if rc.get("reasons"):
+                        st.caption(" · ".join(rc["reasons"][:3]))
 
         st.markdown("**Website reference**")
         sw = website_reference_bytes(item["sku"])
@@ -1814,7 +1987,9 @@ with right:
             if v.get("error"):
                 st.warning("Google Cloud Vision did not run for this image. Filename + room-name analysis was preserved.")
                 st.code(v["error"][:500])
-            st.write("**Labels:**", ", ".join(v.get("labels", [])[:15]) or "—")
+            st.write("**Best guess:**", ", ".join(v.get("best_guess", [])[:10]) or "—")
+            st.write("**Labels:**", ", ".join(v.get("labels", [])[:20]) or "—")
+            st.write("**Objects:**", ", ".join(v.get("objects", [])[:20]) or "—")
             st.write("**Web entities:**", ", ".join(v.get("web_entities", [])[:15]) or "—")
             if v.get("web_pages"):
                 st.write("**Matching web pages:**")
