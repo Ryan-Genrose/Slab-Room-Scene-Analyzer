@@ -726,6 +726,28 @@ def best_collection_link(record, links):
                 best = link
     return best, best_score
 
+
+def is_strict_slab_asset(value):
+    """True only for image files whose basename ends in -Slab or _Slab."""
+    try:
+        path = urlparse(str(value)).path
+    except Exception:
+        path = str(value)
+    name = Path(path).name
+    return bool(re.search(r"(?:-|_)slab\.(?:png|jpe?g|webp)$", name, re.I))
+
+def strict_bundled_references(entry):
+    return [
+        r for r in entry.get("references", [])
+        if is_strict_slab_asset(r.get("filename",""))
+    ]
+
+def strict_reference_stats():
+    materials = load_bundled_reference_catalog().get("materials", {})
+    with_refs = sum(1 for e in materials.values() if strict_bundled_references(e))
+    ref_count = sum(len(strict_bundled_references(e)) for e in materials.values())
+    return len(materials), with_refs, ref_count
+
 def extract_page_images(page_url, page_html, material_name):
     soup = BeautifulSoup(page_html, "html.parser")
     candidates = []
@@ -779,6 +801,10 @@ def extract_page_images(page_url, page_html, material_name):
     for score, url, alt in candidates:
         dedup[url] = max(dedup.get(url, (-999, "")), (score, alt), key=lambda x: x[0])
     ranked = sorted([(v[0], u, v[1]) for u, v in dedup.items()], reverse=True)
+
+    # Never use room scenes, diagrams, Default tiles, SlabImage placeholders, etc.
+    # Reference images shown to users and used by the visual matcher must end in -Slab/_Slab.
+    ranked = [row for row in ranked if is_strict_slab_asset(row[1])]
     return [{"url": u, "score": s, "alt": a} for s, u, a in ranked[:8]]
 
 def extract_skus(page_html):
@@ -850,6 +876,26 @@ def ensure_product(record):
         pass
     return path
 
+
+def clear_product_reference_images(record):
+    """Remove old Product Search references before replacing them with strict -Slab images."""
+    if not product_search_ready():
+        return 0
+    pc = product_client()
+    product_path = ensure_product(record)
+    removed = 0
+    try:
+        refs = list(pc.list_reference_images(parent=product_path))
+        for ref in refs:
+            try:
+                pc.delete_reference_image(name=ref.name)
+                removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return removed
+
 def create_reference_from_bytes(record, image_bytes, ctype, slot, source_url=""):
     if not (storage_ready() and product_search_ready()):
         raise RuntimeError("Google Storage + Product Search must be configured.")
@@ -882,77 +928,92 @@ def create_reference_for_url(record, image_url, slot):
 
 
 def sync_one_website_record(record, links, build_visual):
-    """Build a material's visual reference set.
+    """Build a material reference set using STRICT slab images only.
 
-    Priority:
-    1) Exact slab-image filenames bundled from ProductExport_08-17-2026.xlsx.
-    2) Legacy page-image scrape only if none of those direct assets resolve.
-
-    Only two successful images are added to Product Search so the 403-material
-    catalog stays below 1,000 stored references.
+    Accepted assets must have a basename ending in -Slab or _Slab immediately
+    before the image extension. This deliberately excludes SlabImage, Default,
+    diagrams, room scenes, and generic product imagery.
     """
     bundled = bundled_reference_entry(record["SKU"])
-    resolved_urls = []
-    refs = []
-    visual_signatures = []
+    resolved_assets = []
     errors = []
-
-    if bundled and bundled.get("references"):
-        for ref_row in bundled.get("references", []):
-            if len(resolved_urls) >= MAX_GOOGLE_REFERENCES_PER_MATERIAL:
-                break
-            try:
-                image_bytes, ctype, resolved_url = download_reference_candidates(bundled, ref_row)
-                resolved_urls.append(resolved_url)
-                sig = _signature_vector(image_bytes)
-                if sig:
-                    visual_signatures.append(sig)
-                if build_visual:
-                    refs.append(
-                        create_reference_from_bytes(
-                            record, image_bytes, ctype, len(refs) + 1, resolved_url
-                        )
-                    )
-            except Exception as e:
-                errors.append(f"{ref_row.get('filename','')}: {str(e)[:150]}")
-
-    # If the spreadsheet/direct path did not yield anything, retain the older page
-    # scrape as a safety net.
+    website_skus = []
     link = None
     link_score = 0.0
-    website_skus = []
-    if not resolved_urls and links:
+
+    # 1) Exact spreadsheet-derived filenames, but STRICT -Slab/_Slab only.
+    for ref_row in strict_bundled_references(bundled):
+        if len(resolved_assets) >= MAX_GOOGLE_REFERENCES_PER_MATERIAL:
+            break
+        try:
+            image_bytes, ctype, resolved_url = download_reference_candidates(bundled, ref_row)
+            resolved_assets.append({
+                "bytes": image_bytes,
+                "ctype": ctype,
+                "url": resolved_url,
+                "filename": ref_row.get("filename","")
+            })
+        except Exception as e:
+            errors.append(f"{ref_row.get('filename','')}: {str(e)[:150]}")
+
+    # 2) If the export did not provide a strict slab image, inspect the live collection
+    # page and accept ONLY strict -Slab/_Slab image URLs.
+    if not resolved_assets and links:
         link, link_score = best_collection_link(record, links)
         if link and link_score >= .62:
             try:
                 page_html = fetch_html(link["url"])
-                images = extract_page_images(link["url"], page_html, record["Source Color Name"])
                 website_skus = extract_skus(page_html)
+                images = extract_page_images(link["url"], page_html, record["Source Color Name"])
                 for img in images:
-                    if len(resolved_urls) >= MAX_GOOGLE_REFERENCES_PER_MATERIAL:
+                    if len(resolved_assets) >= MAX_GOOGLE_REFERENCES_PER_MATERIAL:
                         break
                     try:
                         image_bytes, ctype = download_reference_image(img["url"])
-                        resolved_urls.append(img["url"])
-                        sig = _signature_vector(image_bytes)
-                        if sig:
-                            visual_signatures.append(sig)
-                        if build_visual:
-                            refs.append(
-                                create_reference_from_bytes(
-                                    record, image_bytes, ctype, len(refs) + 1, img["url"]
-                                )
-                            )
+                        resolved_assets.append({
+                            "bytes": image_bytes,
+                            "ctype": ctype,
+                            "url": img["url"],
+                            "filename": Path(urlparse(img["url"]).path).name
+                        })
                     except Exception as e:
                         errors.append(f"page:{str(e)[:150]}")
             except Exception as e:
                 errors.append(f"page scrape:{str(e)[:150]}")
 
+    resolved_urls = [x["url"] for x in resolved_assets]
+    visual_signatures = []
+    refs = []
+
+    for asset in resolved_assets:
+        sig = _signature_vector(asset["bytes"])
+        if sig:
+            visual_signatures.append(sig)
+
+    # Replace the old Product Search references rather than leaving the earlier
+    # non-strict images attached to the product.
+    old_refs_removed = 0
+    if build_visual and resolved_assets:
+        old_refs_removed = clear_product_reference_images(record)
+        for slot, asset in enumerate(resolved_assets, start=1):
+            try:
+                refs.append(
+                    create_reference_from_bytes(
+                        record,
+                        asset["bytes"],
+                        asset["ctype"],
+                        slot,
+                        asset["url"]
+                    )
+                )
+            except Exception as e:
+                errors.append(f"Product Search ref {slot}: {str(e)[:150]}")
+
     page_url = bundled.get("page_url","") if bundled else ""
     if not page_url and link:
         page_url = link["url"]
 
-    status = "OK" if resolved_urls else ("NO_REFERENCE_IMAGE" if bundled else "NO_CATALOG_ENTRY")
+    status = "OK" if resolved_assets else "NO_STRICT_SLAB_REFERENCE"
     return record["SKU"], {
         "status": status,
         "stone": record["StoneType"],
@@ -962,11 +1023,14 @@ def sync_one_website_record(record, links, build_visual):
         "page_label": bundled.get("product_line","") if bundled else (link["label"] if link else ""),
         "page_match_score": 1.0 if bundled else link_score,
         "image_urls": resolved_urls,
+        "strict_slab_filenames": [x["filename"] for x in resolved_assets],
         "reference_objects": refs,
         "website_skus": website_skus,
-        "reference_source": "ProductExport spreadsheet / direct website asset" if resolved_urls and bundled else "website page fallback",
+        "reference_source": "STRICT -Slab website asset",
+        "reference_policy": "strict-slab",
         "visual_signatures": visual_signatures,
-        "errors": errors[:5],
+        "old_product_search_refs_removed": old_refs_removed,
+        "errors": errors[:6],
     }
 
 def sync_genrose_website(build_visual=True, max_workers=6):
@@ -1019,20 +1083,37 @@ def website_entry_for_sku(sku):
     return load_website_cache().get("materials", {}).get(str(sku), {})
 
 def website_reference_bytes(sku):
+    """Return only a strict -Slab/_Slab reference image."""
     entry = website_entry_for_sku(sku)
-    refs = [x for x in entry.get("reference_objects", []) if x and not str(x).startswith("ERROR:")]
-    if refs and storage_ready():
-        try:
-            return storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(refs[0]).download_as_bytes()
-        except Exception:
-            pass
-    # Fallback to live website image for display.
+
+    # Old cache entries are intentionally ignored unless the source URL itself
+    # proves it is a strict slab image.
     urls = entry.get("image_urls", [])
-    if urls:
+    refs = [x for x in entry.get("reference_objects", []) if x and not str(x).startswith("ERROR:")]
+
+    for i, url in enumerate(urls):
+        if not is_strict_slab_asset(url):
+            continue
+        if i < len(refs) and storage_ready():
+            try:
+                return storage_client().bucket(
+                    secret("GOOGLE_CLOUD_BUCKET", "")
+                ).blob(refs[i]).download_as_bytes()
+            except Exception:
+                pass
         try:
-            return download_reference_image(urls[0])[0]
+            return download_reference_image(url)[0]
         except Exception:
             pass
+
+    # Bundled direct fallback, strict only.
+    bundled = bundled_reference_entry(sku)
+    for ref in strict_bundled_references(bundled):
+        try:
+            b, _ctype, _url = download_reference_candidates(bundled, ref)
+            return b
+        except Exception:
+            continue
     return None
 
 
@@ -1130,6 +1211,8 @@ def local_reference_search(image_bytes, limit=10):
 
     ranked = []
     for sku, entry in materials.items():
+        if entry.get("reference_policy") != "strict-slab":
+            continue
         sigs = entry.get("visual_signatures", [])
         if not sigs:
             continue
@@ -1163,17 +1246,8 @@ def local_reference_search(image_bytes, limit=10):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def candidate_swatch_bytes(sku):
-    b = website_reference_bytes(sku)
-    if b:
-        return b
-    entry = bundled_reference_entry(sku)
-    for ref in entry.get("references", [])[:3]:
-        try:
-            b, _ctype, _url = download_reference_candidates(entry, ref)
-            return b
-        except Exception:
-            continue
-    return None
+    return website_reference_bytes(sku)
+
 
 # ---------------- analysis hierarchy ----------------
 
@@ -1404,6 +1478,7 @@ def save_review_batch(items):
                 "stone": item["stone"],
                 "sku": item["sku"],
                 "room": item["room"],
+                "decision_status": item.get("decision_status",""),
                 "material_confidence": item["analysis"]["material_confidence"],
                 "room_confidence": item["analysis"]["room_confidence"],
                 "material_method": item["analysis"]["material_method"],
@@ -1443,6 +1518,7 @@ def save_review_batch(items):
                 "stone": item["stone"],
                 "sku": item["sku"],
                 "room": item["room"],
+                "decision_status": item.get("decision_status",""),
                 "material_confidence": item["analysis"]["material_confidence"],
                 "room_confidence": item["analysis"]["room_confidence"],
                 "material_method": item["analysis"]["material_method"],
@@ -1654,27 +1730,30 @@ code{
   display:grid;
   grid-template-columns:1fr auto 1fr;
   align-items:center;
-  min-height:74px;
+  min-height:86px;
   background:#fff;
   border-bottom:1px solid #e6dfdc;
   margin:-1.15rem -2.25rem 0;
   padding:0 2.25rem;
 }
-.gr-brand{
+.gr-brand-image{
   grid-column:2;
   text-align:center;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+.gr-brand-logo{
+  display:block;
+  width:min(360px,42vw);
+  height:auto;
+  object-fit:contain;
+}
+.gr-brand-fallback{
   font-family:Georgia,"Times New Roman",serif;
   font-size:1.55rem;
   letter-spacing:.07em;
   color:#262626!important;
-}
-.gr-brand span{
-  display:block;
-  margin-top:-2px;
-  font-family:Arial,Helvetica,sans-serif;
-  font-size:.52rem;
-  letter-spacing:.30em;
-  color:#6e6260!important;
 }
 .gr-tooltag{
   grid-column:3;
@@ -1975,6 +2054,329 @@ div[data-testid="stVerticalBlockBorderWrapper"] .stButton>button[kind="primary"]
 .gr-minihead{color:#7c706c!important;text-transform:uppercase;letter-spacing:.12em;font-size:.66rem;font-weight:700;margin:.9rem 0 .45rem}
 .gr-current-choice{background:#f3ece8;border-left:3px solid #9b7c72;padding:9px 10px;margin:.45rem 0 .7rem}
 
+
+/* ===== v0.9 editorial workflow refresh ===== */
+
+:root{
+  --gr-rose-deep:#8f685d;
+  --gr-rose:#a77e72;
+  --gr-rose-light:#efe4df;
+  --gr-cream:#fbf8f5;
+  --gr-warm:#f4eeea;
+  --gr-ink2:#252426;
+  --gr-shadow:0 18px 55px rgba(66,50,45,.08);
+}
+
+[data-testid="stAppViewContainer"]>.main{
+  background:
+    radial-gradient(900px 360px at 88% 2%, rgba(205,182,171,.22), transparent 62%),
+    linear-gradient(180deg,#fff 0 360px,#f9f7f4 360px 100%)!important;
+}
+.block-container{
+  max-width:1540px!important;
+  padding:1rem 2.4rem 5rem!important;
+}
+.gr-brandbar{
+  min-height:88px!important;
+  margin:-1rem -2.4rem 0!important;
+  padding:10px 2.4rem 8px!important;
+  background:rgba(255,255,255,.96)!important;
+}
+.gr-brand-logo{
+  width:min(255px,38vw)!important;
+  max-height:64px!important;
+  object-fit:contain!important;
+}
+.gr-tooltag{
+  border:1px solid #d8ceca;
+  padding:6px 10px;
+  background:#faf7f5;
+  color:#766966!important;
+  letter-spacing:.13em!important;
+}
+
+/* hero */
+.gr-hero-kicker{
+  color:var(--gr-rose-deep)!important;
+  font-size:.7rem;
+  letter-spacing:.19em;
+  text-transform:uppercase;
+  font-weight:800;
+  margin-bottom:.45rem;
+}
+.gr-hero-title{
+  font-family:Georgia,"Times New Roman",serif;
+  color:#262426!important;
+  font-size:3.55rem;
+  line-height:.98;
+  letter-spacing:-.045em;
+  font-weight:400;
+  margin:0 0 .8rem;
+}
+.gr-hero-copy{
+  max-width:760px;
+  color:#625c5c!important;
+  font-size:1rem;
+  line-height:1.7;
+}
+.gr-feature-row{
+  display:flex;
+  flex-wrap:wrap;
+  gap:7px;
+  margin-top:1.15rem;
+}
+.gr-feature-pill{
+  border:1px solid #dfd5d1;
+  background:rgba(255,255,255,.8);
+  color:#625a58!important;
+  padding:6px 10px;
+  font-size:.7rem;
+  font-weight:700;
+  letter-spacing:.04em;
+}
+
+/* Reference library hero card */
+.gr-library-card{
+  background:
+    linear-gradient(145deg,rgba(255,255,255,.98),rgba(244,236,232,.96));
+  border:1px solid #d9cfcb;
+  border-top:4px solid var(--gr-rose);
+  padding:20px 20px 16px;
+  box-shadow:var(--gr-shadow);
+  min-height:205px;
+}
+.gr-library-eyebrow{
+  color:#8d746c!important;
+  font-size:.66rem;
+  text-transform:uppercase;
+  letter-spacing:.16em;
+  font-weight:800;
+}
+.gr-library-big{
+  font-family:Georgia,"Times New Roman",serif;
+  font-size:2.45rem;
+  line-height:1;
+  color:#2c2929!important;
+  margin:.35rem 0 .25rem;
+}
+.gr-library-copy{
+  color:#716968!important;
+  font-size:.82rem;
+  line-height:1.45;
+}
+.gr-library-stats{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  border-top:1px solid #ddd2ce;
+  margin-top:14px;
+  padding-top:12px;
+  gap:8px;
+}
+.gr-library-stat span{
+  display:block;
+  color:#918582!important;
+  font-size:.63rem;
+  text-transform:uppercase;
+  letter-spacing:.09em;
+}
+.gr-library-stat b{
+  display:block;
+  color:#302d2d!important;
+  font-family:Georgia,"Times New Roman",serif;
+  font-size:1.16rem;
+  font-weight:400;
+  margin-top:2px;
+}
+
+/* Step headings */
+.gr-stephead{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:20px;
+  margin:2.1rem 0 .75rem;
+  padding-bottom:10px;
+  border-bottom:1px solid #d9d0cc;
+}
+.gr-step-left{
+  display:flex;
+  align-items:center;
+  gap:12px;
+}
+.gr-step-no{
+  width:34px;
+  height:34px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  border-radius:50%;
+  background:#2f2e30;
+  color:#fff!important;
+  font-size:.72rem;
+  font-weight:800;
+  letter-spacing:.04em;
+}
+.gr-step-title{
+  color:#2d2b2c!important;
+  font-family:Georgia,"Times New Roman",serif;
+  font-size:1.45rem;
+  line-height:1;
+}
+.gr-step-sub{
+  color:#817977!important;
+  font-size:.76rem;
+  margin-top:3px;
+}
+
+/* uploader */
+[data-testid="stFileUploader"]{
+  background:
+    linear-gradient(135deg,rgba(255,255,255,.96),rgba(246,240,237,.92))!important;
+  border:1px dashed #bdaaa3!important;
+  border-radius:4px!important;
+  padding:1rem!important;
+  min-height:116px;
+  box-shadow:0 10px 32px rgba(70,53,48,.04)!important;
+}
+[data-testid="stFileUploader"] section{
+  min-height:86px!important;
+}
+[data-testid="stFileUploader"] button{
+  background:#fff!important;
+  border:1px solid #b8aaa5!important;
+  color:#3a3636!important;
+}
+
+/* Action cards */
+.gr-action-card{
+  background:#fff;
+  border:1px solid #ddd5d1;
+  box-shadow:0 12px 38px rgba(69,52,47,.05);
+  padding:17px 18px;
+}
+.gr-action-count{
+  font-family:Georgia,"Times New Roman",serif;
+  font-size:1.8rem;
+  line-height:1;
+  color:#2e2b2c!important;
+}
+.gr-action-copy{
+  color:#786f6d!important;
+  font-size:.79rem;
+  margin-top:5px;
+  line-height:1.4;
+}
+.gr-inline-status{
+  background:#f1e8e4;
+  border-left:3px solid var(--gr-rose);
+  padding:9px 11px;
+  color:#655c5a!important;
+  font-size:.78rem;
+}
+
+/* buttons: compact, confident, editorial */
+.stButton>button,
+.stDownloadButton>button,
+[data-testid="stLinkButton"] a{
+  min-height:40px!important;
+  border-radius:2px!important;
+  padding:.52rem 1.05rem!important;
+  font-size:.69rem!important;
+  letter-spacing:.08em!important;
+  box-shadow:none!important;
+}
+.stButton>button[kind="primary"]{
+  background:var(--gr-rose-deep)!important;
+  border-color:var(--gr-rose-deep)!important;
+  color:#fff!important;
+}
+.stButton>button[kind="primary"]:hover{
+  background:#725248!important;
+  border-color:#725248!important;
+}
+.stButton>button[kind="secondary"],
+.stDownloadButton>button{
+  background:#fff!important;
+  border-color:#bfb2ad!important;
+}
+.stButton>button[kind="secondary"]:hover,
+.stDownloadButton>button:hover{
+  background:#f7f1ee!important;
+  border-color:#8f7f79!important;
+}
+
+/* progress */
+[data-testid="stProgress"]{
+  margin-top:.45rem!important;
+}
+[data-testid="stProgress"]>div>div{
+  background:linear-gradient(90deg,#9f7468,#c3a096)!important;
+  height:7px!important;
+}
+[data-testid="stProgress"] small{
+  color:#726966!important;
+  font-weight:600!important;
+}
+
+/* result metrics */
+[data-testid="stMetric"]{
+  border-top:3px solid #c6afa7!important;
+  background:rgba(255,255,255,.96)!important;
+  min-height:100px!important;
+  padding:16px 18px!important;
+}
+[data-testid="stMetricValue"]{
+  font-size:2.15rem!important;
+}
+
+/* results/action strip */
+.gr-results-actions{
+  background:#eee5e1;
+  border:1px solid #dacdc8;
+  padding:13px 15px;
+  margin:.75rem 0 1.25rem;
+}
+.gr-review-link{
+  background:#fff;
+  border:1px solid #d6cbc7;
+  padding:12px 14px;
+  margin-top:10px;
+}
+.gr-review-link code{
+  display:block;
+  word-break:break-all;
+}
+
+/* correction workspace */
+[data-testid="stVerticalBlockBorderWrapper"]{
+  background:rgba(255,255,255,.98)!important;
+  box-shadow:0 12px 36px rgba(66,50,45,.045)!important;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] .stButton>button[kind="primary"]{
+  background:#8f685d!important;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] .stButton>button[kind="secondary"]{
+  background:#fbfaf9!important;
+}
+
+/* remove the old charcoal banner look if any remain */
+.gr-sectionbar{
+  background:transparent!important;
+  color:#756965!important;
+  padding:0!important;
+  border:0!important;
+  margin:0!important;
+  font-size:.68rem!important;
+  letter-spacing:.14em!important;
+}
+
+@media(max-width:950px){
+  .block-container{padding:1rem 1.1rem 4rem!important;}
+  .gr-brandbar{margin:-1rem -1.1rem 0!important;padding-left:1.1rem!important;padding-right:1.1rem!important;}
+  .gr-hero-title{font-size:2.6rem;}
+  .gr-library-card{margin-top:1rem;}
+}
+
 </style>
 """
 
@@ -1982,10 +2384,20 @@ def inject_genrose_styles():
     st.markdown(GENROSE_STYLE, unsafe_allow_html=True)
 
 def render_genrose_brand(tool_label="ROOM SCENE ANALYZER"):
+    try:
+        logo_b64 = base64.b64encode(GENROSE_LOGO_PATH.read_bytes()).decode("ascii")
+        logo_html = (
+            f'<img class="gr-brand-logo" '
+            f'src="data:image/png;base64,{logo_b64}" '
+            f'alt="GENROSE">'
+        )
+    except Exception:
+        logo_html = '<div class="gr-brand-fallback">GENROSE</div>'
+
     st.markdown(
         f"""<div class="gr-brandbar">
             <div></div>
-            <div class="gr-brand">GENROSE<span>STONE + TILE</span></div>
+            <div class="gr-brand-image">{logo_html}</div>
             <div class="gr-tooltag">{html.escape(tool_label)}</div>
         </div>""",
         unsafe_allow_html=True
@@ -2029,6 +2441,7 @@ def set_item_material(item, stone_name, source="Manual material selection", file
             item["analysis"]["material_confidence"] = 100
             item["analysis"]["material_method"] = source
             item["manual_material"] = True
+            item["decision_status"] = "CONFIRMED"
     clear_manual_filename(item, filename_key)
 
 def set_item_custom_material(item, stone_name, sku, filename_key=None):
@@ -2040,6 +2453,7 @@ def set_item_custom_material(item, stone_name, sku, filename_key=None):
         item["analysis"]["material_confidence"] = 100
         item["analysis"]["material_method"] = "Manual custom material"
         item["manual_material"] = True
+        item["decision_status"] = "NEW_MATERIAL"
         clear_manual_filename(item, filename_key)
 
 def set_item_room(item, room_name, filename_key=None):
@@ -2047,6 +2461,20 @@ def set_item_room(item, room_name, filename_key=None):
     item["room"] = room_name
     item["analysis"]["room_confidence"] = 100
     item["analysis"]["room_method"] = "Manual room selection"
+    clear_manual_filename(item, filename_key)
+
+
+def mark_item_needs_input(item, filename_key=None):
+    item["decision_status"] = "NEEDS_FURTHER_INPUT"
+    item["stone"] = ""
+    item["sku"] = ""
+    item["manual_material"] = False
+    item["analysis"]["material_confidence"] = 0
+    item["analysis"]["material_method"] = "Needs further input"
+    clear_manual_filename(item, filename_key)
+
+def mark_item_new_material(item, filename_key=None):
+    item["decision_status"] = "NEW_MATERIAL"
     clear_manual_filename(item, filename_key)
 
 def render_review_page(batch_id):
@@ -2099,8 +2527,8 @@ def render_review_page(batch_id):
                 suggested_room = item.get("room") or "Other"
                 ext = Path(item["old_name"]).suffix.lower() or ".jpg"
 
-                material_options = ["Needs Review"] + stone_options + ["➕ Custom material"]
-                material_default = suggested_stone if suggested_stone in stone_options else "Needs Review"
+                material_options = ["Needs Further Input"] + stone_options + ["➕ New material"]
+                material_default = suggested_stone if suggested_stone in stone_options else "Needs Further Input"
                 material_choice = st.selectbox(
                     "Material",
                     material_options,
@@ -2113,10 +2541,10 @@ def render_review_page(batch_id):
                 final_sku = suggested_sku
                 added_new_material = False
 
-                if material_choice == "Needs Review":
+                if material_choice == "Needs Further Input":
                     final_stone = ""
                     final_sku = ""
-                elif material_choice == "➕ Custom material":
+                elif material_choice == "➕ New material":
                     added_new_material = True
                     cc1, cc2 = st.columns([1.2, .8])
                     final_stone = re.sub(
@@ -2226,6 +2654,11 @@ def render_review_page(batch_id):
                 "final_material": final_stone,
                 "final_sku": final_sku,
                 "final_room": final_room,
+                "decision_status": (
+                    "NEEDS_FURTHER_INPUT" if material_choice == "Needs Further Input"
+                    else "NEW_MATERIAL" if material_choice == "➕ New material"
+                    else "CONFIRMED"
+                ),
                 "material_confidence": item["material_confidence"],
                 "room_confidence": item["room_confidence"],
                 "approved": approved,
@@ -2253,6 +2686,7 @@ def render_review_page(batch_id):
             html_rows.append(
                 "<tr>"
                 f"<td>{html.escape(status)}</td>"
+                f"<td>{html.escape(d.get('decision_status',''))}</td>"
                 f"<td>{html.escape(d['old_filename'])}</td>"
                 f"<td>{html.escape(d['final_filename'])}</td>"
                 f"<td>{html.escape(d['suggested_material'])}</td>"
@@ -2273,7 +2707,7 @@ def render_review_page(batch_id):
         html_body = (
             f"<h2>{html.escape(subject)}</h2><p>Reviewer: {html.escape(reviewer or 'Not supplied')}</p>"
             "<table border='1' cellpadding='6' cellspacing='0'><thead><tr>"
-            "<th>Status</th><th>Old filename</th><th>Final filename</th><th>Suggested material</th>"
+            "<th>Status</th><th>Decision</th><th>Old filename</th><th>Final filename</th><th>Suggested material</th>"
             "<th>Final material</th><th>SKU</th><th>Room</th><th>Confidence</th><th>Notes</th>"
             "</tr></thead><tbody>" + "".join(html_rows) + "</tbody></table>"
         )
@@ -2302,49 +2736,65 @@ inject_genrose_styles()
 render_genrose_brand()
 
 
-st.markdown('<div class="gr-kicker">INTERNAL IMAGE OPERATIONS</div>', unsafe_allow_html=True)
-st.title("Room Scene Analyzer")
-st.markdown(
-    '<div class="gr-lede">Upload manufacturer room scenes and get a proposed material, SKU, room type and production-ready filename. '
-    'Filename intelligence is checked first. When it is incomplete, the analyzer compares the room scene against the synced GENROSE slab reference library and surfaces visual candidates with swatches for quick correction.</div>',
-    unsafe_allow_html=True
-)
+hero_left, hero_right = st.columns([1.6, .72], gap="large")
+
+with hero_left:
+    st.markdown('<div class="gr-hero-kicker">INTERNAL IMAGE OPERATIONS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="gr-hero-title">Room Scene Analyzer</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="gr-hero-copy">Turn messy manufacturer room scenes into consistent, reviewable production assets. '
+        'The analyzer reads the original filename first, identifies the room, compares weak material matches against the synced GENROSE slab library, '
+        'and keeps every uncertain decision easy to correct.</div>'
+        '<div class="gr-feature-row">'
+        '<span class="gr-feature-pill">FILENAME FIRST</span>'
+        '<span class="gr-feature-pill">GENROSE VISUAL REFERENCES</span>'
+        '<span class="gr-feature-pill">EDITABLE OUTPUT</span>'
+        '<span class="gr-feature-pill">HUMAN REVIEW BUILT IN</span>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
 website_cache = load_website_cache()
 website_count = sum(1 for x in website_cache.get("materials", {}).values() if x.get("status") == "OK")
 signature_count = sum(1 for x in website_cache.get("materials", {}).values() if x.get("visual_signatures"))
-bundled_total, bundled_with_refs, bundled_files = bundled_reference_stats()
+bundled_total, bundled_with_refs, bundled_files = strict_reference_stats()
 
-st.markdown(
-    f'<div class="gr-reference-panel">'
-    f'<div class="gr-ref-lead"><strong>GENROSE Slab Reference Library</strong>'
-    f'<span>Sync once to build swatches and the immediate visual matcher used when filenames are weak.</span></div>'
-    f'<div class="gr-ref-stat"><span>Mapped</span><b>{bundled_with_refs}/{bundled_total}</b></div>'
-    f'<div class="gr-ref-stat"><span>Downloaded</span><b>{website_count}</b></div>'
-    f'<div class="gr-ref-stat"><span>Visual index</span><b>{signature_count}</b></div>'
-    f'</div>',
-    unsafe_allow_html=True
-)
-ref_left, ref_right = st.columns([.76,.24])
-with ref_left:
-    if website_cache.get("synced_at"):
-        st.caption("Last reference sync · " + website_cache["synced_at"][:19].replace("T"," "))
-    else:
-        st.caption("Reference library has not been synced with this build yet.")
-with ref_right:
-    if st.button("SYNC / REFRESH REFERENCES", type="primary", use_container_width=True):
-        if not storage_ready():
-            st.error("Google Cloud Storage must be configured before references can be synced.")
+with hero_right:
+    library_ready = signature_count > 0
+    st.markdown(
+        f'<div class="gr-library-card">'
+        f'<div class="gr-library-eyebrow">GENROSE REFERENCE LIBRARY</div>'
+        f'<div class="gr-library-big">{signature_count if signature_count else "Not synced"}</div>'
+        f'<div class="gr-library-copy">'
+        f'{"materials indexed from strict -Slab reference images" if library_ready else "Build the strict -Slab reference index before relying on visual fallback."}'
+        f'</div>'
+        f'<div class="gr-library-stats">'
+        f'<div class="gr-library-stat"><span>Mapped</span><b>{bundled_with_refs}/{bundled_total}</b></div>'
+        f'<div class="gr-library-stat"><span>Downloaded</span><b>{website_count}</b></div>'
+        f'<div class="gr-library-stat"><span>Visual index</span><b>{signature_count}</b></div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+    sync_col, stamp_col = st.columns([.62,.38], gap="small")
+    with sync_col:
+        if st.button("REFRESH LIBRARY", type="primary", use_container_width=False):
+            if not storage_ready():
+                st.error("Google Cloud Storage must be configured before references can be synced.")
+            else:
+                try:
+                    synced = sync_genrose_website(build_visual=product_search_ready())
+                    ok = sum(1 for x in synced["materials"].values() if x.get("status") == "OK")
+                    sigs = sum(1 for x in synced["materials"].values() if x.get("visual_signatures"))
+                    st.success(f"Strict -Slab library refreshed · {ok} materials downloaded · {sigs} ready for immediate visual matching.")
+                    st.rerun()
+                except Exception as e:
+                    st.exception(e)
+    with stamp_col:
+        if website_cache.get("synced_at"):
+            st.caption("Last sync\n" + website_cache["synced_at"][5:16].replace("T"," · "))
         else:
-            try:
-                synced = sync_genrose_website(build_visual=product_search_ready())
-                ok = sum(1 for x in synced["materials"].values() if x.get("status") == "OK")
-                sigs = sum(1 for x in synced["materials"].values() if x.get("visual_signatures"))
-                st.success(f"Reference sync complete · {ok} materials downloaded · {sigs} ready for immediate visual matching.")
-                if product_search_ready():
-                    st.info("Immediate reference matching works now. Google Product Search may take longer to index the same images.")
-                st.rerun()
-            except Exception as e:
-                st.exception(e)
+            st.caption("Never synced")
 
 with st.sidebar:
     st.header("Controls")
@@ -2363,9 +2813,17 @@ with st.sidebar:
     st.write("Product Search", "✅" if product_search_ready() else "⚠️")
     st.caption("Reference syncing and daily workflow controls are on the main screen.")
 
-st.markdown('<div class="gr-sectionbar">01 · Add Room Scenes</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="gr-stephead">'
+    '<div class="gr-step-left"><span class="gr-step-no">01</span><div>'
+    '<div class="gr-step-title">Add room scenes</div>'
+    '<div class="gr-step-sub">Drag in a batch of manufacturer JPG, PNG or WEBP files.</div>'
+    '</div></div></div>',
+    unsafe_allow_html=True
+)
+
 uploads = st.file_uploader(
-    "Drop JPG / PNG / WEBP files here",
+    "Drop room scene images here",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
     key=f"upload_{st.session_state.upload_key}",
@@ -2383,19 +2841,56 @@ if uploads:
 pending = st.session_state.pending
 
 if pending and not st.session_state.results:
-    st.markdown('<div class="gr-sectionbar">02 · Analyze</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="gr-current-choice"><strong>{len(pending)} images ready</strong><br>'
-        f'<span class="gr-meta">Filename → room classification → GENROSE reference comparison → review candidates.</span></div>',
+        '<div class="gr-stephead">'
+        '<div class="gr-step-left"><span class="gr-step-no">02</span><div>'
+        '<div class="gr-step-title">Analyze the batch</div>'
+        '<div class="gr-step-sub">Filename → room → slab references → correction candidates.</div>'
+        '</div></div></div>',
         unsafe_allow_html=True
     )
-    if not vision_ready():
-        st.warning("Google Cloud Vision is not configured. Filename + Italian/English room analysis will still run; cloud enrichment will be skipped.")
-    if st.button(f"RUN ANALYSIS · {len(pending)} IMAGES", type="primary", use_container_width=True):
-        progress = st.progress(0, text="Starting analysis…")
+
+    analyze_left, analyze_right = st.columns([1.65,.55], gap="large")
+    with analyze_left:
+        st.markdown(
+            f'<div class="gr-action-card">'
+            f'<div class="gr-action-count">{len(pending)} scenes ready</div>'
+            f'<div class="gr-action-copy">Run the complete naming pass. Nothing is renamed automatically — every result remains editable.</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+        if not vision_ready():
+            st.markdown(
+                '<div class="gr-inline-status">Cloud Vision is not configured. Filename and reference matching will still run, but room identification will be less robust.</div>',
+                unsafe_allow_html=True
+            )
+    with analyze_right:
+        st.write("")
+        st.write("")
+        run_analysis = st.button(
+            f"ANALYZE {len(pending)} SCENES",
+            type="primary",
+            use_container_width=False
+        )
+        clear_pending = st.button(
+            "CLEAR BATCH",
+            use_container_width=False
+        )
+        if clear_pending:
+            st.session_state.pending = []
+            st.session_state.results = []
+            st.session_state.selected = 0
+            st.session_state.upload_key += 1
+            st.rerun()
+
+    if run_analysis:
+        progress = st.progress(0, text="Preparing analysis…")
         results = []
         for i, item in enumerate(pending, start=1):
-            progress.progress((i-1) / len(pending), text=f"Analyzing {i}/{len(pending)}: {item['name']}")
+            progress.progress(
+                (i-1) / len(pending),
+                text=f"Analyzing {i} of {len(pending)} · {item['name']}"
+            )
             try:
                 analysis = analyze_image(item["name"], item["bytes"])
             except Exception as e:
@@ -2418,10 +2913,11 @@ if pending and not st.session_state.results:
                 "stone": analysis["stone"],
                 "sku": analysis["sku"],
                 "room": analysis["room"],
-                "new_name": new_name
+                "new_name": new_name,
+                "decision_status": "AUTO_MATCH" if analysis["stone"] else "NEEDS_REVIEW"
             })
-        progress.progress(1.0, text="Analysis complete.")
-        time.sleep(.25)
+        progress.progress(1.0, text="Analysis complete")
+        time.sleep(.2)
         progress.empty()
         st.session_state.results = results
         st.session_state.selected = 0
@@ -2464,44 +2960,62 @@ summary_df = pd.DataFrame([{
     "Material": x["stone"] or "Needs Review",
     "SKU": x["sku"] or "NEED-SKU",
     "Room": x["room"],
+    "Decision Status": x.get("decision_status",""),
     "Material Confidence": f'{x["analysis"]["material_confidence"]}%',
     "Room Confidence": f'{x["analysis"]["room_confidence"]}%',
     "Method": x["analysis"]["material_method"],
     "Website Verified": "YES" if x["analysis"].get("website_verified") else "NO"
 } for x in results])
 
-st.markdown('<div class="gr-sectionbar">03 · Results</div>', unsafe_allow_html=True)
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Images", len(results))
-m2.metric("Ready", high)
-m3.metric("Review", review)
-m4.metric("References matched", sum(1 for x in results if x["analysis"].get("website_verified")))
-
-pub1, pub2 = st.columns([1.2, .8])
-if pub1.button("CREATE REVIEW LINK", type="primary", use_container_width=True):
-    batch_id, url = save_review_batch(results)
-    st.session_state.review_url = url
-    st.success("Review page created from this app's live URL.")
-
-pub2.download_button(
-    "DOWNLOAD ANALYSIS CSV",
-    summary_df.to_csv(index=False).encode("utf-8-sig"),
-    "room_scene_analysis.csv",
-    "text/csv",
-    use_container_width=True
+st.markdown(
+    '<div class="gr-stephead">'
+    '<div class="gr-step-left"><span class="gr-step-no">03</span><div>'
+    '<div class="gr-step-title">Review the results</div>'
+    '<div class="gr-step-sub">Correct uncertain matches, confirm the room, and edit the final filename.</div>'
+    '</div></div></div>',
+    unsafe_allow_html=True
 )
 
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Scenes", len(results))
+m2.metric("Ready", high)
+m3.metric("Needs review", review)
+m4.metric("References matched", sum(1 for x in results if x["analysis"].get("website_verified")))
+
+st.markdown('<div class="gr-results-actions">', unsafe_allow_html=True)
+act_spacer, act_review, act_csv = st.columns([1.0,.34,.34], gap="small")
+with act_review:
+    if st.button("CREATE REVIEW LINK", type="primary", use_container_width=False):
+        batch_id, url = save_review_batch(results)
+        st.session_state.review_url = url
+        st.success("Review page created.")
+with act_csv:
+    st.download_button(
+        "DOWNLOAD CSV",
+        summary_df.to_csv(index=False).encode("utf-8-sig"),
+        "room_scene_analysis.csv",
+        "text/csv",
+        use_container_width=False
+    )
+st.markdown('</div>', unsafe_allow_html=True)
+
 if st.session_state.review_url:
-    st.markdown("### Review URL")
-    st.code(st.session_state.review_url)
     review_id = st.session_state.review_url.split("review=", 1)[-1]
     st.markdown(
-        f'<a href="?review={html.escape(review_id)}" target="_blank" '
-        'style="display:inline-block;padding:10px 16px;background:#303033;color:white;text-decoration:none;'
-        'font-weight:700;letter-spacing:.04em;margin:4px 0 8px">TEST REVIEW PAGE IN THIS APP</a>',
+        f'<div class="gr-review-link"><div class="gr-library-eyebrow">REVIEW LINK READY</div>'
+        f'<code>{html.escape(st.session_state.review_url)}</code></div>',
         unsafe_allow_html=True
     )
-    st.warning("If another person gets a Streamlit access screen, the app itself is private. Use Streamlit Share → Make this app public, or invite that reviewer by email.")
+    r1, r2, r3 = st.columns([.22,.22,1], gap="small")
+    with r1:
+        st.markdown(
+            f'<a href="?review={html.escape(review_id)}" target="_blank" '
+            'style="display:inline-block;padding:10px 14px;background:#8f685d;color:white;text-decoration:none;'
+            'font-size:11px;font-weight:700;letter-spacing:.08em">TEST REVIEW PAGE</a>',
+            unsafe_allow_html=True
+        )
+    with r2:
+        st.caption("Make the Streamlit app public before sending this link outside your account.")
 
 st.markdown('<div class="gr-rule"></div>', unsafe_allow_html=True)
 left, center, right = st.columns([0.78, 1.38, 1.22], gap="large")
@@ -2585,11 +3099,40 @@ with right:
                 )
         else:
             st.markdown(
+                '<div class="gr-meta" style="margin:.15rem 0 .4rem">No strict <strong>-Slab</strong> reference image is available for this material.</div>',
+                unsafe_allow_html=True
+            )
+            st.markdown(
                 f'<div class="gr-current-choice"><strong>{html.escape(item["stone"] or "Needs Review")}</strong><br>'
                 f'<span class="gr-meta">SKU · {html.escape(item["sku"] or "NEED-SKU")} · '
                 f'{analysis["material_confidence"]}% confidence</span></div>',
                 unsafe_allow_html=True
             )
+
+        decision_a, decision_b = st.columns(2, gap="small")
+        with decision_a:
+            if st.button(
+                "CAN'T IDENTIFY · NEED INPUT",
+                key=f"needs_input_{idx}",
+                use_container_width=True
+            ):
+                mark_item_needs_input(item, filename_key)
+                st.session_state[material_key] = "Needs Review"
+                st.rerun()
+        with decision_b:
+            if st.button(
+                "NEW MATERIAL",
+                key=f"new_material_{idx}",
+                use_container_width=True
+            ):
+                mark_item_new_material(item, filename_key)
+                st.session_state[f"show_new_material_{idx}"] = True
+                st.rerun()
+
+        if item.get("decision_status") == "NEEDS_FURTHER_INPUT":
+            st.warning("Marked for further input. Room and filename can still be corrected now.")
+        elif item.get("decision_status") == "NEW_MATERIAL":
+            st.info("This item is being treated as a new / uncataloged material.")
 
         material_candidates = analysis.get("material_candidates", [])[:5]
         if material_candidates:
@@ -2602,7 +3145,7 @@ with right:
                         if sw:
                             st.image(Image.open(io.BytesIO(sw)), use_container_width=True)
                         else:
-                            st.caption("No swatch")
+                            st.caption("No -Slab reference")
                     with c2:
                         st.markdown(f"**{c['stone']}**")
                         st.caption(
@@ -2616,15 +3159,19 @@ with right:
                             set_item_material(item, c["stone"], "Selected material candidate", filename_key)
                             st.rerun()
 
-        with st.expander("Material not in the master list?", expanded=False):
+        show_new_material = st.session_state.get(f"show_new_material_{idx}", False) or item.get("decision_status") == "NEW_MATERIAL"
+        with st.expander("New / uncataloged material details", expanded=show_new_material):
             cm1, cm2 = st.columns([1.2,.8])
-            custom_material = cm1.text_input("Custom material", key=f"custom_material_{idx}", placeholder="Material name")
-            custom_sku = cm2.text_input("Base SKU", key=f"custom_sku_{idx}", placeholder="SKU")
-            if st.button("USE CUSTOM MATERIAL", key=f"use_custom_material_{idx}", use_container_width=True):
+            custom_material = cm1.text_input("New material name", key=f"custom_material_{idx}", placeholder="Material name")
+            custom_sku = cm2.text_input("Base SKU", key=f"custom_sku_{idx}", placeholder="Leave blank if unknown")
+            if st.button("SAVE NEW MATERIAL", key=f"use_custom_material_{idx}", type="primary", use_container_width=True):
                 if custom_material.strip():
                     set_item_custom_material(item, custom_material, custom_sku, filename_key)
                     st.session_state[material_key] = "Needs Review"
+                    st.session_state[f"show_new_material_{idx}"] = False
                     st.rerun()
+                else:
+                    st.warning("Enter a material name first.")
 
         st.markdown('<div class="gr-minihead">2 · Room type</div>', unsafe_allow_html=True)
         room_key = f"main_room_{idx}"
@@ -2664,12 +3211,15 @@ with right:
                         st.rerun()
 
         st.markdown('<div class="gr-minihead">3 · Output filename</div>', unsafe_allow_html=True)
-        generated_name = item.get("generated_name") or proposed_filename(
-            item.get("sku") or "NEED-SKU",
-            item.get("stone") or "UnknownMaterial",
-            item.get("room") or "Other",
-            item.get("ext") or ".jpg"
-        )
+        if item.get("decision_status") == "NEEDS_FURTHER_INPUT":
+            generated_name = safe_filename(f"NEED-INPUT-{item.get('room') or 'Other'}") + (item.get("ext") or ".jpg")
+        else:
+            generated_name = item.get("generated_name") or proposed_filename(
+                item.get("sku") or "NEED-SKU",
+                item.get("stone") or "UnknownMaterial",
+                item.get("room") or "Other",
+                item.get("ext") or ".jpg"
+            )
         if filename_key not in st.session_state:
             st.session_state[filename_key] = item.get("new_name") or generated_name
 
@@ -2710,13 +3260,14 @@ with right:
             st.write("Objects:", ", ".join(v.get("objects", [])[:20]) or "—")
 
 st.markdown('<div class="gr-rule"></div>', unsafe_allow_html=True)
-st.markdown('<div class="gr-sectionbar">04 · Export</div>', unsafe_allow_html=True)
+st.markdown('<div class="gr-stephead"><div class="gr-step-left"><span class="gr-step-no">04</span><div><div class="gr-step-title">Export</div><div class="gr-step-sub">Download the corrected naming table for production.</div></div></div></div>', unsafe_allow_html=True)
 latest_summary_df = pd.DataFrame([{
     "Old Filename": x["name"],
     "New Filename": x["new_name"],
     "Material": x["stone"] or "Needs Review",
     "SKU": x["sku"] or "NEED-SKU",
     "Room": x["room"],
+    "Decision Status": x.get("decision_status",""),
     "Material Confidence": f'{x["analysis"]["material_confidence"]}%',
     "Room Confidence": f'{x["analysis"]["room_confidence"]}%',
     "Method": x["analysis"]["material_method"],

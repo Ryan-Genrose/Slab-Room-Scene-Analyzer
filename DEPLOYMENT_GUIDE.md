@@ -1,4 +1,4 @@
-# DEPLOYMENT GUIDE — GENROSE Room Scene Analyzer v0.8.0
+# DEPLOYMENT GUIDE — GENROSE Room Scene Analyzer v0.9.1
 
 You do not need to install Python locally. Everything can be done in a browser.
 
@@ -14,8 +14,8 @@ You do not need to install Python locally. Everything can be done in a browser.
 5. Choose **Private** if you do not want the code public.
 6. Click **Create repository**.
 7. On the empty repository page, click **uploading an existing file**.
-8. Unzip the downloaded `Slab_Room_Scene_Manager_v0.8.0.zip`.
-9. Open the folder `Slab_Room_Scene_Manager_v0.8.0`.
+8. Unzip the downloaded `Slab_Room_Scene_Manager_v0.9.1.zip`.
+9. Open the folder `Slab_Room_Scene_Manager_v0.9.1`.
 10. Drag everything INSIDE that folder into GitHub.
     The GitHub repository root should directly contain:
     - `app.py`
@@ -286,7 +286,7 @@ in `app.py` for future batches.
 
 
 ## If every result is Unknown / 0%
-v0.8.0 prevents this failure mode. If Google Cloud returns a 403 because Vision is
+v0.9.1 prevents this failure mode. If Google Cloud returns a 403 because Vision is
 disabled in the service-account project, the app still returns filename + room results.
 Enable Cloud Vision in the exact project named by the Google error to restore cloud
 enrichment.
@@ -299,8 +299,8 @@ Streamlit's app settings and are not contained in this repository package.
 
 
 ## Review link note
-v0.8.0 automatically builds review links from the live Streamlit URL. `APP_BASE_URL`
-is retained only as a fallback. After deploying v0.8.0, generate a NEW review link;
+v0.9.1 automatically builds review links from the live Streamlit URL. `APP_BASE_URL`
+is retained only as a fallback. After deploying v0.9.1, generate a NEW review link;
 links created by older builds may point to an obsolete Streamlit app URL.
 
 
@@ -312,7 +312,7 @@ The analyzer now includes a relative TEST REVIEW PAGE button so you can verify a
 new batch before sending the absolute link.
 
 
-## v0.8.0 first reference sync
+## v0.9.1 first reference sync
 After Streamlit redeploys, open the admin sidebar and click
 `SYNC GENROSE SLAB REFERENCES` once. The app uses the bundled product-export mapping
 to download the known slab images into your private Cloud Storage bucket and register
@@ -320,7 +320,14 @@ up to two references per material in Google Product Search. You do not need to u
 the Excel file to Streamlit; the extracted mapping is already bundled in `data/`.
 
 
-## v0.8.0 reference refresh
+## v0.9.1 reference refresh
 After deploying, click the visible `SYNC / REFRESH REFERENCES` button once. This
 version builds an immediate visual-reference index in addition to the Google Product
 Search catalog. The immediate matcher is usable as soon as the sync completes.
+
+
+## v0.9.1 mandatory refresh
+After deploying, click `REFRESH LIBRARY` once. v0.9.1 intentionally discards old
+non-slab references and rebuilds the local visual index using only image files whose
+basename ends in `-Slab` or `_Slab`. It also replaces the Product Search references
+for each successfully resolved material.
