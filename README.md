@@ -1,4 +1,4 @@
-# GENROSE Room Scene Analyzer v0.9.1
+# GENROSE Room Scene Analyzer v0.9.2
 
 ## Daily workflow
 1. Drop a batch of room-scene images.
@@ -29,22 +29,22 @@ Example:
 See `DEPLOYMENT_GUIDE.md`.
 
 
-## v0.9.1 critical fix
+## v0.9.2 critical fix
 A Google Cloud Vision 403/API-disabled error no longer wipes out the filename parser.
 Filename material matching and English/Italian room detection always run first and
 remain visible even if Google Cloud fails. Cloud Vision is now enrichment/fallback,
 not a single point of failure.
 
 
-## v0.9.1 UI pass
+## v0.9.2 UI pass
 Redesigned the daily interface: collapsed admin sidebar, cleaner dark workspace, compact summary cards, cleaner queue/preview/match layout, and reduced diagnostic clutter.
 
 
-## v0.9.1 visual redesign
+## v0.9.2 visual redesign
 Full readability/design pass: consistent dark cards, readable queue items, scrollable review workspace, high-contrast controls, polished evidence presentation, and diagnostics kept out of the primary workflow.
 
 
-## v0.9.1 — dedicated room classifier
+## v0.9.2 — dedicated room classifier
 Room detection is no longer just keyword matching over generic Vision labels.
 It now combines Google Vision Label Detection, Web Detection best guesses/entities,
 Object Localization, OCR, filename English/Italian terms, and weighted scene rules.
@@ -55,7 +55,7 @@ desk/counter + commercial/lobby/waiting cues even when Google never literally
 returns "reception desk".
 
 
-## v0.9.1 — conservative slab identification
+## v0.9.2 — conservative slab identification
 Material matching is now intentionally conservative:
 - filename is the primary material source
 - GENROSE website cache verifies canonical material/SKU
@@ -65,7 +65,7 @@ Material matching is now intentionally conservative:
 - Google Vision remains fully active for room/space classification
 
 
-## v0.9.1 — crash fix + GENROSE visual redesign
+## v0.9.2 — crash fix + GENROSE visual redesign
 - Fixed the Results-count TypeError caused by summing truthy SKU/material strings.
 - Full repository package is safe to upload as a replacement.
 - Restyled to echo the GENROSE website: white editorial header, blush navigation band,
@@ -74,7 +74,7 @@ Material matching is now intentionally conservative:
 - The top Download Analysis CSV control is now a real download instead of a dead button.
 
 
-## v0.9.1 — manual correction + durable review links
+## v0.9.2 — manual correction + durable review links
 - Added a searchable Correct Material selector directly in the main Match panel.
 - Selecting a material automatically pulls its canonical base SKU and immediately
   rebuilds the `SKU-StoneType-RoomType` filename.
@@ -85,7 +85,7 @@ Material matching is now intentionally conservative:
 - Existing review-page material/room overrides remain available to the reviewer.
 
 
-## v0.9.1 — correction-first workflow
+## v0.9.2 — correction-first workflow
 - Original filename is shown first in the Match panel and first on every review item.
 - Output filename is a real editable text field; edit the entire filename directly.
 - Manual filenames survive Streamlit reruns and CSV/review-link creation.
@@ -98,7 +98,7 @@ Material matching is now intentionally conservative:
 - Review batch payload now carries room/material candidates for reviewer context.
 
 
-## v0.9.1 — spreadsheet-driven GENROSE slab visual references
+## v0.9.2 — spreadsheet-driven GENROSE slab visual references
 - Bundled `data/genrose_reference_catalog.json`, generated from `ProductExport_08-17-2026.xlsx`.
 - Uses the spreadsheet's Color Name / Material / Tile Type Image data as the source
   of exact slab-image filenames.
@@ -112,7 +112,7 @@ Material matching is now intentionally conservative:
 - Removed the decorative PRODUCTS / CUSTOM CAPABILITIES / INSPIRATION / RESOURCES / LOCATIONS strip.
 
 
-## v0.9.1 — UX rebuild + immediate reference matching
+## v0.9.2 — UX rebuild + immediate reference matching
 - Sync / Refresh References is now a large main-screen action with mapped/downloaded/indexed status.
 - Reference sync creates immediate local color/texture signatures from the GENROSE slab images.
 - Weak filenames are compared against those synced references immediately; no Product Search indexing wait is required.
@@ -124,13 +124,13 @@ Material matching is now intentionally conservative:
 - Hidden sidebar is simplified to batch clearing and connection status only.
 
 
-## v0.9.1 — real GENROSE logo
+## v0.9.2 — real GENROSE logo
 - Replaced the text-built GENROSE / STONE + TILE header treatment with the supplied official logo image.
 - Removed the extra synthetic `STONE + TILE` text entirely.
 - Added `assets/genrose-logo.png` to the repository package.
 
 
-## v0.9.1 — GENROSE editorial workflow refresh
+## v0.9.2 — GENROSE editorial workflow refresh
 - Rebuilt the top of the app around a two-column editorial hero and a compact reference-library status card.
 - Replaced black full-width section bars with numbered editorial step headers.
 - Replaced the full-width Analyze button with a compact right-side action group.
@@ -141,7 +141,7 @@ Material matching is now intentionally conservative:
 - Preserved all v0.8.1 analysis, reference matching, review, swatch, and correction functionality.
 
 
-## v0.9.1 — strict slab references + escalation states
+## v0.9.2 — strict slab references + escalation states
 - All displayed and newly synced material reference images must end in `-Slab` or `_Slab` immediately before the image extension.
 - `SlabImage`, `Default`, diagrams, room scenes, and generic product imagery are excluded from swatches and the immediate visual matcher.
 - Reference refresh now removes the old Product Search reference images for a material before registering the strict slab references.
@@ -150,3 +150,13 @@ Material matching is now intentionally conservative:
 - Added an expanded new-material entry workflow with optional base SKU.
 - `Needs Further Input`, `New Material`, and confirmation states are carried into CSV/review batches.
 - Review page now supports `Needs Further Input` and `New material` as explicit material decisions.
+
+
+## v0.9.2 — non-destructive transactional reference refresh
+- Fixed the destructive refresh bug: a strict refresh can no longer replace the existing reference cache with an empty/failed library.
+- Existing per-material cache entries are preserved unless a new strict `-Slab` reference successfully resolves.
+- Sync checkpoints the merged cache every 20 materials so Streamlit timeouts/restarts do not lose successful progress.
+- Product Search legacy references are deleted only after strict replacements have been created successfully.
+- Added derived strict-filename probing (`SlabImage` → `-Slab`, plural `-Slabs` → `-Slab`, suffixless export names → `-Slab`) to find strict assets that exist in the same website folder but are not listed directly in the export.
+- Live sync status now reports strict-ready, updated-this-run, previous-preserved, no-strict-image, and error counts.
+- Renamed the confusing `Mapped` stat to `Probeable from export`.

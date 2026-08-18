@@ -1,6 +1,7 @@
 
 import base64
 import collections
+import copy
 import difflib
 import hashlib
 import html
@@ -736,16 +737,100 @@ def is_strict_slab_asset(value):
     name = Path(path).name
     return bool(re.search(r"(?:-|_)slab\.(?:png|jpe?g|webp)$", name, re.I))
 
+def _strict_filename_variants(filename):
+    """Generate likely strict -Slab filenames from an exported image filename.
+
+    The product export sometimes gives us SlabImage or another product image while
+    the same website folder contains the real slab asset. Probe conservative filename
+    transforms instead of treating the export filename as the only possibility.
+    """
+    filename = str(filename or "").strip()
+    if not filename:
+        return []
+
+    p = Path(filename)
+    ext = p.suffix.lower() if p.suffix else ".png"
+    stem = p.stem
+    candidates = []
+
+    def add(stem_value, extension=ext):
+        stem_value = str(stem_value or "").strip()
+        if not stem_value:
+            return
+        # Canonicalize the terminal suffix to exactly -Slab.
+        stem_value = re.sub(r"(?i)(?:-|_)slabs?$", "-Slab", stem_value)
+        value = stem_value + extension
+        if is_strict_slab_asset(value) and value not in candidates:
+            candidates.append(value)
+
+    if is_strict_slab_asset(filename):
+        candidates.append(filename)
+
+    # Common export convention: ..._SlabImage.png -> ...-Slab.png / ..._Slab.png
+    if re.search(r"(?i)slabimage$", stem):
+        base = re.sub(r"(?i)(?:-|_)?slabimage$", "", stem).rstrip("-_")
+        add(base + "-Slab")
+        add(base + "_Slab")
+
+    # Plural slab filenames are occasionally used in exports.
+    if re.search(r"(?i)(?:-|_)slabs$", stem):
+        base = re.sub(r"(?i)(?:-|_)slabs$", "", stem).rstrip("-_")
+        add(base + "-Slab")
+        add(base + "_Slab")
+
+    # Some exported product images omit the slab suffix entirely.
+    if not re.search(r"(?i)(?:-|_)slab(?:image)?$", stem):
+        add(stem.rstrip("-_") + "-Slab")
+        add(stem.rstrip("-_") + "_Slab")
+
+    # Try the same strict basename as JPG too; some site folders mix PNG/JPG.
+    current = list(candidates)
+    for value in current:
+        vp = Path(value)
+        if vp.suffix.lower() != ".jpg":
+            alt = vp.with_suffix(".jpg").name
+            if alt not in candidates:
+                candidates.append(alt)
+
+    return candidates[:8]
+
+
 def strict_bundled_references(entry):
+    """Spreadsheet references that are already strict -Slab assets."""
     return [
         r for r in entry.get("references", [])
         if is_strict_slab_asset(r.get("filename",""))
     ]
 
+
+def strict_reference_probe_rows(entry):
+    """Reference rows to probe, including derived -Slab filename candidates."""
+    rows = []
+    seen = set()
+    refs = entry.get("references", [])
+
+    # Exact strict references first.
+    for ref in refs:
+        fn = str(ref.get("filename", ""))
+        if is_strict_slab_asset(fn) and fn not in seen:
+            rows.append({**ref, "filename": fn, "derived": False})
+            seen.add(fn)
+
+    # Then conservative derived filenames from the export rows.
+    for ref in refs:
+        for fn in _strict_filename_variants(ref.get("filename", "")):
+            if fn in seen:
+                continue
+            rows.append({**ref, "filename": fn, "derived": True, "derived_from": ref.get("filename", "")})
+            seen.add(fn)
+            if len(rows) >= 12:
+                return rows
+    return rows
+
 def strict_reference_stats():
     materials = load_bundled_reference_catalog().get("materials", {})
-    with_refs = sum(1 for e in materials.values() if strict_bundled_references(e))
-    ref_count = sum(len(strict_bundled_references(e)) for e in materials.values())
+    with_refs = sum(1 for e in materials.values() if strict_reference_probe_rows(e))
+    ref_count = sum(len(strict_reference_probe_rows(e)) for e in materials.values())
     return len(materials), with_refs, ref_count
 
 def extract_page_images(page_url, page_html, material_name):
@@ -877,8 +962,12 @@ def ensure_product(record):
     return path
 
 
-def clear_product_reference_images(record):
-    """Remove old Product Search references before replacing them with strict -Slab images."""
+def cleanup_legacy_product_references(record):
+    """Delete only the old `website-*` Product Search references.
+
+    Strict references are staged first. If strict creation fails, the legacy Product
+    Search references remain untouched so a refresh can never blank the cloud catalog.
+    """
     if not product_search_ready():
         return 0
     pc = product_client()
@@ -887,6 +976,9 @@ def clear_product_reference_images(record):
     try:
         refs = list(pc.list_reference_images(parent=product_path))
         for ref in refs:
+            ref_id = str(ref.name).rsplit('/', 1)[-1]
+            if not ref_id.startswith('website-'):
+                continue
             try:
                 pc.delete_reference_image(name=ref.name)
                 removed += 1
@@ -896,7 +988,7 @@ def clear_product_reference_images(record):
         pass
     return removed
 
-def create_reference_from_bytes(record, image_bytes, ctype, slot, source_url=""):
+def create_reference_from_bytes(record, image_bytes, ctype, slot, source_url="", ref_prefix="website"):
     if not (storage_ready() and product_search_ready()):
         raise RuntimeError("Google Storage + Product Search must be configured.")
 
@@ -907,7 +999,7 @@ def create_reference_from_bytes(record, image_bytes, ctype, slot, source_url="")
     blob.upload_from_string(image_bytes, content_type=ctype)
 
     product_path = ensure_product(record)
-    ref_id = f"website-{slot:02d}"
+    ref_id = f"{ref_prefix}-{slot:02d}"
     ref = vision.ReferenceImage(uri=f"gs://{bucket_name}/{obj}")
     try:
         product_client().create_reference_image(
@@ -928,11 +1020,11 @@ def create_reference_for_url(record, image_url, slot):
 
 
 def sync_one_website_record(record, links, build_visual):
-    """Build a material reference set using STRICT slab images only.
+    """Resolve strict -Slab references without destroying the existing library.
 
-    Accepted assets must have a basename ending in -Slab or _Slab immediately
-    before the image extension. This deliberately excludes SlabImage, Default,
-    diagrams, room scenes, and generic product imagery.
+    The product export is used as a filename seed. If it gives `SlabImage` or a
+    non-slab image, likely `-Slab` variants are probed in the same GENROSE folder.
+    Product Search strict refs are created before legacy refs are removed.
     """
     bundled = bundled_reference_entry(record["SKU"])
     resolved_assets = []
@@ -941,23 +1033,26 @@ def sync_one_website_record(record, links, build_visual):
     link = None
     link_score = 0.0
 
-    # 1) Exact spreadsheet-derived filenames, but STRICT -Slab/_Slab only.
-    for ref_row in strict_bundled_references(bundled):
+    # 1) Probe exact and derived strict -Slab filenames from the product export.
+    for ref_row in strict_reference_probe_rows(bundled):
         if len(resolved_assets) >= MAX_GOOGLE_REFERENCES_PER_MATERIAL:
             break
         try:
             image_bytes, ctype, resolved_url = download_reference_candidates(bundled, ref_row)
+            if not is_strict_slab_asset(resolved_url):
+                continue
             resolved_assets.append({
                 "bytes": image_bytes,
                 "ctype": ctype,
                 "url": resolved_url,
-                "filename": ref_row.get("filename","")
+                "filename": Path(urlparse(resolved_url).path).name,
+                "derived": bool(ref_row.get("derived")),
+                "derived_from": ref_row.get("derived_from", "")
             })
         except Exception as e:
-            errors.append(f"{ref_row.get('filename','')}: {str(e)[:150]}")
+            errors.append(f"{ref_row.get('filename','')}: {str(e)[:120]}")
 
-    # 2) If the export did not provide a strict slab image, inspect the live collection
-    # page and accept ONLY strict -Slab/_Slab image URLs.
+    # 2) Page scrape fallback. extract_page_images itself is strict.
     if not resolved_assets and links:
         link, link_score = best_collection_link(record, links)
         if link and link_score >= .62:
@@ -970,16 +1065,20 @@ def sync_one_website_record(record, links, build_visual):
                         break
                     try:
                         image_bytes, ctype = download_reference_image(img["url"])
+                        if not is_strict_slab_asset(img["url"]):
+                            continue
                         resolved_assets.append({
                             "bytes": image_bytes,
                             "ctype": ctype,
                             "url": img["url"],
-                            "filename": Path(urlparse(img["url"]).path).name
+                            "filename": Path(urlparse(img["url"]).path).name,
+                            "derived": False,
+                            "derived_from": ""
                         })
                     except Exception as e:
-                        errors.append(f"page:{str(e)[:150]}")
+                        errors.append(f"page:{str(e)[:120]}")
             except Exception as e:
-                errors.append(f"page scrape:{str(e)[:150]}")
+                errors.append(f"page scrape:{str(e)[:120]}")
 
     resolved_urls = [x["url"] for x in resolved_assets]
     visual_signatures = []
@@ -990,11 +1089,10 @@ def sync_one_website_record(record, links, build_visual):
         if sig:
             visual_signatures.append(sig)
 
-    # Replace the old Product Search references rather than leaving the earlier
-    # non-strict images attached to the product.
-    old_refs_removed = 0
+    # Stage strict Product Search refs first. Never clear the old catalog up front.
+    legacy_removed = 0
+    strict_refs_created = 0
     if build_visual and resolved_assets:
-        old_refs_removed = clear_product_reference_images(record)
         for slot, asset in enumerate(resolved_assets, start=1):
             try:
                 refs.append(
@@ -1003,11 +1101,17 @@ def sync_one_website_record(record, links, build_visual):
                         asset["bytes"],
                         asset["ctype"],
                         slot,
-                        asset["url"]
+                        asset["url"],
+                        ref_prefix="strict"
                     )
                 )
+                strict_refs_created += 1
             except Exception as e:
-                errors.append(f"Product Search ref {slot}: {str(e)[:150]}")
+                errors.append(f"Product Search strict ref {slot}: {str(e)[:120]}")
+
+        # Only after at least one strict cloud reference exists do we remove legacy refs.
+        if strict_refs_created:
+            legacy_removed = cleanup_legacy_product_references(record)
 
     page_url = bundled.get("page_url","") if bundled else ""
     if not page_url and link:
@@ -1029,13 +1133,19 @@ def sync_one_website_record(record, links, build_visual):
         "reference_source": "STRICT -Slab website asset",
         "reference_policy": "strict-slab",
         "visual_signatures": visual_signatures,
-        "old_product_search_refs_removed": old_refs_removed,
-        "errors": errors[:6],
+        "strict_product_refs_created": strict_refs_created,
+        "legacy_product_refs_removed": legacy_removed,
+        "derived_reference_count": sum(1 for x in resolved_assets if x.get("derived")),
+        "errors": errors[:8],
     }
 
 def sync_genrose_website(build_visual=True, max_workers=6):
-    # The spreadsheet-based direct asset catalog is primary. The live page index
-    # is optional and used only as a fallback for missing/moved assets.
+    """Refresh references transactionally.
+
+    Existing successful cache entries are NEVER replaced by an error/empty result.
+    New strict successes are merged in as they complete and checkpointed periodically,
+    so a timeout/restart cannot erase the previous library.
+    """
     links = []
     try:
         index_html = fetch_html(GENROSE_INDEX)
@@ -1043,15 +1153,27 @@ def sync_genrose_website(build_visual=True, max_workers=6):
     except Exception:
         links = []
 
-    cache = {
-        "synced_at": datetime.now(timezone.utc).isoformat(),
-        "source": GENROSE_INDEX,
-        "materials": {}
-    }
+    previous = load_website_cache()
+    cache = copy.deepcopy(previous) if isinstance(previous, dict) else {}
+    cache.setdefault("materials", {})
+    cache["refresh_started_at"] = datetime.now(timezone.utc).isoformat()
+    cache["source"] = GENROSE_INDEX
+    cache["refresh_policy"] = "strict-slab-transactional"
 
-    progress = st.progress(0, text="Building GENROSE slab reference catalog…")
+    progress = st.progress(0, text="Preparing strict slab refresh…")
     status = st.empty()
+    metrics = st.empty()
     done = 0
+    strict_ok_this_run = 0
+    retained_previous = 0
+    no_ref = 0
+    errors = 0
+
+    def strict_ready_count():
+        return sum(
+            1 for x in cache.get("materials", {}).values()
+            if x.get("status") == "OK" and x.get("reference_policy") == "strict-slab" and x.get("visual_signatures")
+        )
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
@@ -1060,23 +1182,69 @@ def sync_genrose_website(build_visual=True, max_workers=6):
         }
         for future in as_completed(futures):
             r = futures[future]
+            sku = str(r["SKU"])
+            old_entry = cache["materials"].get(sku, {})
             try:
-                sku, entry = future.result()
+                _sku, fresh = future.result()
             except Exception as e:
-                sku = str(r["SKU"])
-                entry = {
+                fresh = {
                     "status": "ERROR", "stone": r["StoneType"], "sku": sku,
-                    "page_url": "", "image_urls": [], "reference_objects": [],
-                    "website_skus": [], "error": str(e)[:300]
+                    "error": str(e)[:300], "errors": [str(e)[:300]]
                 }
-            cache["materials"][sku] = entry
+
+            if fresh.get("status") == "OK" and fresh.get("visual_signatures"):
+                cache["materials"][sku] = fresh
+                strict_ok_this_run += 1
+                latest_status = "STRICT SLAB READY"
+            else:
+                # Preserve any previous usable entry. Do not blank a material because
+                # the refresh could not improve it this time.
+                if old_entry:
+                    kept = copy.deepcopy(old_entry)
+                    kept["last_refresh_status"] = fresh.get("status", "ERROR")
+                    kept["last_refresh_errors"] = fresh.get("errors", []) or ([fresh.get("error")] if fresh.get("error") else [])
+                    kept["last_refresh_at"] = datetime.now(timezone.utc).isoformat()
+                    cache["materials"][sku] = kept
+                    retained_previous += 1
+                    latest_status = f"{fresh.get('status','ERROR')} · previous kept"
+                else:
+                    cache["materials"][sku] = fresh
+                    if fresh.get("status") == "NO_STRICT_SLAB_REFERENCE":
+                        no_ref += 1
+                    else:
+                        errors += 1
+                    latest_status = fresh.get("status", "ERROR")
+
             done += 1
-            progress.progress(done / len(catalog_records), text=f"Synced {done}/{len(catalog_records)} materials")
-            if done % 12 == 0:
-                status.caption(f"Latest: {entry.get('stone')} — {entry.get('status')}")
+            ready_now = strict_ready_count()
+            progress.progress(done / len(catalog_records), text=f"Scanned {done}/{len(catalog_records)} materials")
+            status.caption(f"Latest: {r['StoneType']} — {latest_status}")
+            metrics.markdown(
+                f"**Strict ready:** {ready_now} &nbsp;&nbsp; "
+                f"**New/updated this run:** {strict_ok_this_run} &nbsp;&nbsp; "
+                f"**Previous preserved:** {retained_previous} &nbsp;&nbsp; "
+                f"**No strict slab:** {no_ref} &nbsp;&nbsp; **Errors:** {errors}"
+            )
+
+            # Checkpoint successful merged state. A killed Streamlit run still keeps progress.
+            if done % 20 == 0:
+                cache["refresh_checkpoint_at"] = datetime.now(timezone.utc).isoformat()
+                save_website_cache(cache)
+
+    cache["synced_at"] = datetime.now(timezone.utc).isoformat()
+    cache["refresh_finished_at"] = cache["synced_at"]
+    cache["refresh_summary"] = {
+        "scanned": done,
+        "strict_updated": strict_ok_this_run,
+        "previous_preserved": retained_previous,
+        "no_strict_slab": no_ref,
+        "errors": errors,
+        "strict_ready_total": strict_ready_count(),
+    }
     save_website_cache(cache)
     progress.empty()
     status.empty()
+    metrics.empty()
     return cache
 
 def website_entry_for_sku(sku):
@@ -1108,10 +1276,11 @@ def website_reference_bytes(sku):
 
     # Bundled direct fallback, strict only.
     bundled = bundled_reference_entry(sku)
-    for ref in strict_bundled_references(bundled):
+    for ref in strict_reference_probe_rows(bundled):
         try:
-            b, _ctype, _url = download_reference_candidates(bundled, ref)
-            return b
+            b, _ctype, url = download_reference_candidates(bundled, ref)
+            if is_strict_slab_asset(url):
+                return b
         except Exception:
             continue
     return None
@@ -2756,8 +2925,15 @@ with hero_left:
 
 website_cache = load_website_cache()
 website_count = sum(1 for x in website_cache.get("materials", {}).values() if x.get("status") == "OK")
-signature_count = sum(1 for x in website_cache.get("materials", {}).values() if x.get("visual_signatures"))
-bundled_total, bundled_with_refs, bundled_files = strict_reference_stats()
+signature_count = sum(
+    1 for x in website_cache.get("materials", {}).values()
+    if x.get("reference_policy") == "strict-slab" and x.get("visual_signatures")
+)
+legacy_preserved_count = sum(
+    1 for x in website_cache.get("materials", {}).values()
+    if x.get("visual_signatures") and x.get("reference_policy") != "strict-slab"
+)
+bundled_total, bundled_probeable, bundled_probe_files = strict_reference_stats()
 
 with hero_right:
     library_ready = signature_count > 0
@@ -2766,16 +2942,18 @@ with hero_right:
         f'<div class="gr-library-eyebrow">GENROSE REFERENCE LIBRARY</div>'
         f'<div class="gr-library-big">{signature_count if signature_count else "Not synced"}</div>'
         f'<div class="gr-library-copy">'
-        f'{"materials indexed from strict -Slab reference images" if library_ready else "Build the strict -Slab reference index before relying on visual fallback."}'
+        f'{"materials ready with strict -Slab reference images" if library_ready else "Refresh the library to build strict -Slab references. Existing synced data is preserved until a strict replacement succeeds."}'
         f'</div>'
         f'<div class="gr-library-stats">'
-        f'<div class="gr-library-stat"><span>Mapped</span><b>{bundled_with_refs}/{bundled_total}</b></div>'
-        f'<div class="gr-library-stat"><span>Downloaded</span><b>{website_count}</b></div>'
+        f'<div class="gr-library-stat"><span>Probeable from export</span><b>{bundled_probeable}/{bundled_total}</b></div>'
+        f'<div class="gr-library-stat"><span>Library entries</span><b>{website_count}</b></div>'
         f'<div class="gr-library-stat"><span>Visual index</span><b>{signature_count}</b></div>'
         f'</div>'
         f'</div>',
         unsafe_allow_html=True
     )
+    if legacy_preserved_count:
+        st.caption(f"{legacy_preserved_count} previous reference entries are preserved as backup while strict replacements are built.")
     sync_col, stamp_col = st.columns([.62,.38], gap="small")
     with sync_col:
         if st.button("REFRESH LIBRARY", type="primary", use_container_width=False):
@@ -2784,9 +2962,10 @@ with hero_right:
             else:
                 try:
                     synced = sync_genrose_website(build_visual=product_search_ready())
-                    ok = sum(1 for x in synced["materials"].values() if x.get("status") == "OK")
-                    sigs = sum(1 for x in synced["materials"].values() if x.get("visual_signatures"))
-                    st.success(f"Strict -Slab library refreshed · {ok} materials downloaded · {sigs} ready for immediate visual matching.")
+                    summary = synced.get("refresh_summary", {})
+                    strict_ready = summary.get("strict_ready_total", 0)
+                    preserved = summary.get("previous_preserved", 0)
+                    st.success(f"Refresh complete · {strict_ready} strict slab references ready · {preserved} previous entries preserved where no strict replacement was found.")
                     st.rerun()
                 except Exception as e:
                     st.exception(e)
