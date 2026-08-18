@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote
 
 import pandas as pd
 import requests
@@ -41,6 +41,9 @@ LOCAL_DATA.mkdir(exist_ok=True)
 LOCAL_REVIEW_ROOT = LOCAL_DATA / "review_batches"
 LOCAL_REVIEW_ROOT.mkdir(exist_ok=True)
 LOCAL_WEBSITE_CACHE = LOCAL_DATA / "genrose_website_catalog.json"
+REFERENCE_CATALOG_PATH = ROOT / "data" / "genrose_reference_catalog.json"
+GENROSE_ASSET_BASE = "https://www.genrose.com/Customer-Content/www/Products/TileTypes"
+MAX_GOOGLE_REFERENCES_PER_MATERIAL = 2
 
 GENROSE_INDEX = "https://www.genrose.com/Products/natural-stone-slabs/"
 REVIEW_EMAIL = "marketing@genrose.com"
@@ -470,8 +473,7 @@ def run_google_vision(image_bytes):
             "error": str(e)
         }
 
-def run_product_search(image_bytes, limit=8):
-    """Visual similarity against the website-built reference catalog."""
+def _product_search_single(image_bytes, limit=8):
     if not product_search_ready():
         return []
 
@@ -504,11 +506,59 @@ def run_product_search(image_bytes, limit=8):
             "stone": rec["StoneType"],
             "sku": rec["SKU"],
             "source_name": rec["Source Color Name"],
+            "material_type": labels.get("material_type",""),
             "score": float(result.score),
             "source": "Google Product Search",
             "reference_image": result.image
         })
     return results
+
+def _jpeg_bytes_for_crop(image, box):
+    crop = image.crop(box)
+    buf = io.BytesIO()
+    if crop.mode not in ("RGB", "L"):
+        crop = crop.convert("RGB")
+    crop.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+def run_product_search(image_bytes, limit=8, multi_crop=False):
+    """Search the GENROSE Product Search catalog.
+
+    When filename evidence is very weak, also search a few large room-scene crops.
+    Stone is often only a countertop/wall/floor region, so this can surface a better
+    visual candidate than whole-image matching alone.
+    """
+    if not product_search_ready():
+        return []
+
+    queries = [("full", image_bytes)]
+    if multi_crop:
+        try:
+            im = Image.open(io.BytesIO(image_bytes))
+            w, h = im.size
+            # Large overlapping crops; deliberately few to control API usage.
+            boxes = [
+                ("center", (int(w*.15), int(h*.12), int(w*.85), int(h*.88))),
+                ("lower", (0, int(h*.42), w, h)),
+            ]
+            for name, box in boxes:
+                if box[2] > box[0] + 50 and box[3] > box[1] + 50:
+                    queries.append((name, _jpeg_bytes_for_crop(im, box)))
+        except Exception:
+            pass
+
+    by_sku = {}
+    for query_name, qbytes in queries:
+        try:
+            for result in _product_search_single(qbytes, limit):
+                sku = result["sku"]
+                if sku not in by_sku or result["score"] > by_sku[sku]["score"]:
+                    by_sku[sku] = {**result, "query_region": query_name}
+        except Exception:
+            continue
+
+    ranked = sorted(by_sku.values(), key=lambda x: x["score"], reverse=True)
+    return ranked[:limit]
 
 def vision_text_material_candidates(vision_data, limit=8):
     evidence = " ".join(
@@ -531,6 +581,59 @@ def vision_text_material_candidates(vision_data, limit=8):
         })
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:limit]
+
+
+# ---------------- bundled GENROSE slab-image references ----------------
+
+@st.cache_data
+def load_bundled_reference_catalog():
+    try:
+        return json.loads(REFERENCE_CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"materials": {}}
+
+def bundled_reference_entry(sku):
+    return load_bundled_reference_catalog().get("materials", {}).get(str(sku), {})
+
+def bundled_reference_stats():
+    materials = load_bundled_reference_catalog().get("materials", {})
+    with_refs = sum(1 for e in materials.values() if e.get("references"))
+    total_refs = sum(len(e.get("references", [])) for e in materials.values())
+    return len(materials), with_refs, total_refs
+
+def reference_url_candidates(entry, reference):
+    filename = str(reference.get("filename","")).strip()
+    if not filename:
+        return []
+    filename_q = quote(filename, safe="-_.()")
+    urls = []
+    for folder in entry.get("folder_slugs", []):
+        folder = str(folder or "").strip("/")
+        if not folder:
+            continue
+        urls.append(f"{GENROSE_ASSET_BASE}/{quote(folder, safe='-')}/{filename_q}")
+    return list(dict.fromkeys(urls))
+
+def download_reference_candidates(entry, reference):
+    headers = {
+        "User-Agent": "Mozilla/5.0 GENROSE-room-scene-reference-builder/1.0",
+        "Referer": "https://www.genrose.com/"
+    }
+    failures = []
+    for url in reference_url_candidates(entry, reference):
+        try:
+            r = requests.get(url, headers=headers, timeout=25)
+            if r.status_code >= 400:
+                failures.append(f"{r.status_code} {url}")
+                continue
+            ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
+            if not ctype.startswith("image/"):
+                failures.append(f"not-image {url}")
+                continue
+            return r.content, ctype, url
+        except Exception as e:
+            failures.append(f"{type(e).__name__}: {url}")
+    raise RuntimeError("No working direct GENROSE asset URL. " + " | ".join(failures[:4]))
 
 # ---------------- GENROSE website reference catalog ----------------
 
@@ -704,7 +807,11 @@ def ensure_product(record):
             product_category="general-v1",
             product_labels=[
                 vision.Product.KeyValue(key="sku", value=str(record["SKU"])),
-                vision.Product.KeyValue(key="stone", value=str(record["StoneType"]))
+                vision.Product.KeyValue(key="stone", value=str(record["StoneType"])),
+                vision.Product.KeyValue(
+                    key="material_type",
+                    value=str(bundled_reference_entry(record["SKU"]).get("material_type",""))
+                )
             ]
         )
         try:
@@ -719,11 +826,10 @@ def ensure_product(record):
         pass
     return path
 
-def create_reference_for_url(record, image_url, slot):
+def create_reference_from_bytes(record, image_bytes, ctype, slot, source_url=""):
     if not (storage_ready() and product_search_ready()):
         raise RuntimeError("Google Storage + Product Search must be configured.")
 
-    image_bytes, ctype = download_reference_image(image_url)
     ext = ".png" if "png" in ctype else ".webp" if "webp" in ctype else ".jpg"
     bucket_name = secret("GOOGLE_CLOUD_BUCKET", "")
     obj = f"website_references/{record['SKU']}/ref-{slot:02d}{ext}"
@@ -742,60 +848,107 @@ def create_reference_for_url(record, image_url, slot):
     except AlreadyExists:
         pass
     except Exception as e:
-        # It may already exist with an older image. Keep the stored reference object for review display.
         if "already exists" not in str(e).lower():
             raise
     return obj
 
+def create_reference_for_url(record, image_url, slot):
+    image_bytes, ctype = download_reference_image(image_url)
+    return create_reference_from_bytes(record, image_bytes, ctype, slot, image_url)
+
+
 def sync_one_website_record(record, links, build_visual):
-    link, link_score = best_collection_link(record, links)
-    if not link or link_score < .62:
-        return record["SKU"], {
-            "status": "NO_PAGE_MATCH",
-            "stone": record["StoneType"],
-            "sku": record["SKU"],
-            "page_url": "",
-            "page_match_score": link_score,
-            "image_urls": [],
-            "reference_objects": [],
-            "website_skus": []
-        }
+    """Build a material's visual reference set.
 
-    page_html = fetch_html(link["url"])
-    images = extract_page_images(link["url"], page_html, record["Source Color Name"])
-    website_skus = extract_skus(page_html)
+    Priority:
+    1) Exact slab-image filenames bundled from ProductExport_08-17-2026.xlsx.
+    2) Legacy page-image scrape only if none of those direct assets resolve.
+
+    Only two successful images are added to Product Search so the 403-material
+    catalog stays below 1,000 stored references.
+    """
+    bundled = bundled_reference_entry(record["SKU"])
+    resolved_urls = []
     refs = []
+    errors = []
 
-    if build_visual:
-        # Use three strongest website images as Product Search references.
-        for slot, img in enumerate(images[:3], start=1):
+    if bundled and bundled.get("references"):
+        for ref_row in bundled.get("references", []):
+            if len(resolved_urls) >= MAX_GOOGLE_REFERENCES_PER_MATERIAL:
+                break
             try:
-                refs.append(create_reference_for_url(record, img["url"], slot))
+                image_bytes, ctype, resolved_url = download_reference_candidates(bundled, ref_row)
+                resolved_urls.append(resolved_url)
+                if build_visual:
+                    refs.append(
+                        create_reference_from_bytes(
+                            record, image_bytes, ctype, len(refs) + 1, resolved_url
+                        )
+                    )
             except Exception as e:
-                refs.append(f"ERROR:{str(e)[:140]}")
+                errors.append(f"{ref_row.get('filename','')}: {str(e)[:150]}")
 
+    # If the spreadsheet/direct path did not yield anything, retain the older page
+    # scrape as a safety net.
+    link = None
+    link_score = 0.0
+    website_skus = []
+    if not resolved_urls and links:
+        link, link_score = best_collection_link(record, links)
+        if link and link_score >= .62:
+            try:
+                page_html = fetch_html(link["url"])
+                images = extract_page_images(link["url"], page_html, record["Source Color Name"])
+                website_skus = extract_skus(page_html)
+                for img in images:
+                    if len(resolved_urls) >= MAX_GOOGLE_REFERENCES_PER_MATERIAL:
+                        break
+                    try:
+                        resolved_urls.append(img["url"])
+                        if build_visual:
+                            refs.append(create_reference_for_url(record, img["url"], len(refs) + 1))
+                    except Exception as e:
+                        errors.append(f"page:{str(e)[:150]}")
+            except Exception as e:
+                errors.append(f"page scrape:{str(e)[:150]}")
+
+    page_url = bundled.get("page_url","") if bundled else ""
+    if not page_url and link:
+        page_url = link["url"]
+
+    status = "OK" if resolved_urls else ("NO_REFERENCE_IMAGE" if bundled else "NO_CATALOG_ENTRY")
     return record["SKU"], {
-        "status": "OK",
+        "status": status,
         "stone": record["StoneType"],
         "sku": record["SKU"],
-        "page_url": link["url"],
-        "page_label": link["label"],
-        "page_match_score": link_score,
-        "image_urls": [x["url"] for x in images[:3]],
+        "material_type": bundled.get("material_type","") if bundled else "",
+        "page_url": page_url,
+        "page_label": bundled.get("product_line","") if bundled else (link["label"] if link else ""),
+        "page_match_score": 1.0 if bundled else link_score,
+        "image_urls": resolved_urls,
         "reference_objects": refs,
-        "website_skus": website_skus
+        "website_skus": website_skus,
+        "reference_source": "ProductExport spreadsheet / direct website asset" if resolved_urls and bundled else "website page fallback",
+        "errors": errors[:5],
     }
 
 def sync_genrose_website(build_visual=True, max_workers=6):
-    index_html = fetch_html(GENROSE_INDEX)
-    links = extract_collection_links(index_html)
+    # The spreadsheet-based direct asset catalog is primary. The live page index
+    # is optional and used only as a fallback for missing/moved assets.
+    links = []
+    try:
+        index_html = fetch_html(GENROSE_INDEX)
+        links = extract_collection_links(index_html)
+    except Exception:
+        links = []
+
     cache = {
         "synced_at": datetime.now(timezone.utc).isoformat(),
         "source": GENROSE_INDEX,
         "materials": {}
     }
 
-    progress = st.progress(0, text="Reading GENROSE slab catalog…")
+    progress = st.progress(0, text="Building GENROSE slab reference catalog…")
     status = st.empty()
     done = 0
 
@@ -962,7 +1115,7 @@ def analyze_image(filename, image_bytes):
     product_results = []
     if top_filename < .90 and product_search_ready():
         try:
-            product_results = run_product_search(image_bytes, 8)
+            product_results = run_product_search(image_bytes, 10, multi_crop=(top_filename < .55))
         except Exception as e:
             vision_data["product_search_error"] = str(e)
 
@@ -1349,19 +1502,6 @@ code{
   color:#807572!important;
   font-weight:700;
 }
-.gr-navstrip{
-  margin:0 -2.25rem 2rem;
-  padding:9px 2.25rem 8px;
-  background:var(--gr-blush);
-  border-bottom:1px solid #dfd4d0;
-  text-align:center;
-  color:#454043!important;
-  font-size:.67rem;
-  font-weight:700;
-  letter-spacing:.13em;
-  text-transform:uppercase;
-  word-spacing:1rem;
-}
 .gr-kicker{
   color:#8c736a!important;
   font-size:.72rem;
@@ -1635,7 +1775,6 @@ div[data-testid="stVerticalBlockBorderWrapper"] .stButton>button[kind="primary"]
 @media(max-width:1100px){
   .block-container{padding:1rem!important;}
   .gr-brandbar{margin:-1rem -1rem 0;padding:0 1rem;}
-  .gr-navstrip{margin:0 -1rem 1.5rem;padding-left:1rem;padding-right:1rem;}
   .gr-tooltag{display:none;}
   h1{font-size:2.25rem!important;}
 }
@@ -1651,8 +1790,7 @@ def render_genrose_brand(tool_label="ROOM SCENE ANALYZER"):
             <div></div>
             <div class="gr-brand">GENROSE<span>STONE + TILE</span></div>
             <div class="gr-tooltag">{html.escape(tool_label)}</div>
-        </div>
-        <div class="gr-navstrip">PRODUCTS &nbsp; CUSTOM CAPABILITIES &nbsp; INSPIRATION &nbsp; RESOURCES &nbsp; LOCATIONS</div>""",
+        </div>""",
         unsafe_allow_html=True
     )
 
@@ -2005,25 +2143,22 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Reference Catalog")
-    st.write(f"Website products cached: **{website_count} / {len(catalog_records)}**")
+    bundled_total, bundled_with_refs, bundled_files = bundled_reference_stats()
+    st.write(f"Spreadsheet materials: **{bundled_with_refs} / {bundled_total}** with slab-image filenames")
+    st.caption(f"{bundled_files} clean slab-image filename candidates bundled from ProductExport_08-17-2026.xlsx")
+    st.write(f"Synced references: **{website_count} / {len(catalog_records)}**")
     if website_cache.get("synced_at"):
         st.caption("Last sync: " + website_cache["synced_at"][:19].replace("T", " "))
 
-    build_refs = st.toggle(
-        "Also build Google visual references",
-        value=True,
-        help="Downloads up to 3 GENROSE website images per material and adds them to Google Product Search."
-    )
-    if st.button("SYNC GENROSE WEBSITE", use_container_width=True):
-        if build_refs and not (storage_ready() and product_search_ready()):
+    if st.button("SYNC GENROSE SLAB REFERENCES", use_container_width=True):
+        if not (storage_ready() and product_search_ready()):
             st.error("Configure Google Cloud Storage and Product Search first.")
         else:
             try:
-                synced = sync_genrose_website(build_visual=build_refs)
+                synced = sync_genrose_website(build_visual=True)
                 ok = sum(1 for x in synced["materials"].values() if x.get("status") == "OK")
-                st.success(f"Website sync complete: {ok} matched materials.")
-                if build_refs:
-                    st.info("Google Product Search indexing is asynchronous; visual references may not affect searches immediately.")
+                st.success(f"Reference sync complete: {ok} materials resolved.")
+                st.info("Google Product Search indexing is asynchronous. New visual references can take time before they affect matching.")
                 st.rerun()
             except Exception as e:
                 st.exception(e)
@@ -2143,7 +2278,7 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("Images", len(results))
 m2.metric("Ready", high)
 m3.metric("Review", review)
-m4.metric("Website matched", sum(1 for x in results if x["analysis"].get("website_verified")))
+m4.metric("References matched", sum(1 for x in results if x["analysis"].get("website_verified")))
 
 pub1, pub2 = st.columns([1.2, .8])
 if pub1.button("CREATE REVIEW LINK", type="primary", use_container_width=True):

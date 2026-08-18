@@ -1,4 +1,4 @@
-# GENROSE Room Scene Analyzer v0.7.2
+# GENROSE Room Scene Analyzer v0.7.3
 
 ## Daily workflow
 1. Drop a batch of room-scene images.
@@ -29,22 +29,22 @@ Example:
 See `DEPLOYMENT_GUIDE.md`.
 
 
-## v0.7.2 critical fix
+## v0.7.3 critical fix
 A Google Cloud Vision 403/API-disabled error no longer wipes out the filename parser.
 Filename material matching and English/Italian room detection always run first and
 remain visible even if Google Cloud fails. Cloud Vision is now enrichment/fallback,
 not a single point of failure.
 
 
-## v0.7.2 UI pass
+## v0.7.3 UI pass
 Redesigned the daily interface: collapsed admin sidebar, cleaner dark workspace, compact summary cards, cleaner queue/preview/match layout, and reduced diagnostic clutter.
 
 
-## v0.7.2 visual redesign
+## v0.7.3 visual redesign
 Full readability/design pass: consistent dark cards, readable queue items, scrollable review workspace, high-contrast controls, polished evidence presentation, and diagnostics kept out of the primary workflow.
 
 
-## v0.7.2 — dedicated room classifier
+## v0.7.3 — dedicated room classifier
 Room detection is no longer just keyword matching over generic Vision labels.
 It now combines Google Vision Label Detection, Web Detection best guesses/entities,
 Object Localization, OCR, filename English/Italian terms, and weighted scene rules.
@@ -55,7 +55,7 @@ desk/counter + commercial/lobby/waiting cues even when Google never literally
 returns "reception desk".
 
 
-## v0.7.2 — conservative slab identification
+## v0.7.3 — conservative slab identification
 Material matching is now intentionally conservative:
 - filename is the primary material source
 - GENROSE website cache verifies canonical material/SKU
@@ -65,7 +65,7 @@ Material matching is now intentionally conservative:
 - Google Vision remains fully active for room/space classification
 
 
-## v0.7.2 — crash fix + GENROSE visual redesign
+## v0.7.3 — crash fix + GENROSE visual redesign
 - Fixed the Results-count TypeError caused by summing truthy SKU/material strings.
 - Full repository package is safe to upload as a replacement.
 - Restyled to echo the GENROSE website: white editorial header, blush navigation band,
@@ -74,7 +74,7 @@ Material matching is now intentionally conservative:
 - The top Download Analysis CSV control is now a real download instead of a dead button.
 
 
-## v0.7.2 — manual correction + durable review links
+## v0.7.3 — manual correction + durable review links
 - Added a searchable Correct Material selector directly in the main Match panel.
 - Selecting a material automatically pulls its canonical base SKU and immediately
   rebuilds the `SKU-StoneType-RoomType` filename.
@@ -85,7 +85,7 @@ Material matching is now intentionally conservative:
 - Existing review-page material/room overrides remain available to the reviewer.
 
 
-## v0.7.2 — correction-first workflow
+## v0.7.3 — correction-first workflow
 - Original filename is shown first in the Match panel and first on every review item.
 - Output filename is a real editable text field; edit the entire filename directly.
 - Manual filenames survive Streamlit reruns and CSV/review-link creation.
@@ -96,3 +96,17 @@ Material matching is now intentionally conservative:
 - Review page was rebuilt with editable material, room and final filename fields.
 - Review links include an in-app relative test link and a clear Streamlit-sharing warning.
 - Review batch payload now carries room/material candidates for reviewer context.
+
+
+## v0.7.3 — spreadsheet-driven GENROSE slab visual references
+- Bundled `data/genrose_reference_catalog.json`, generated from `ProductExport_08-17-2026.xlsx`.
+- Uses the spreadsheet's Color Name / Material / Tile Type Image data as the source
+  of exact slab-image filenames.
+- Builds direct GENROSE asset URLs using the website's
+  `/Customer-Content/www/Products/TileTypes/<product-line-slug>/<image-file>` structure.
+- Direct exported slab images are tried before fragile page scraping.
+- Caps Product Search at 2 successful reference images per material.
+- Product Search becomes the visual fallback only when filename material evidence is weak.
+- Very weak filenames trigger whole-image + center + lower-room crop searches and merge
+  the best SKU scores.
+- Removed the decorative PRODUCTS / CUSTOM CAPABILITIES / INSPIRATION / RESOURCES / LOCATIONS strip.
