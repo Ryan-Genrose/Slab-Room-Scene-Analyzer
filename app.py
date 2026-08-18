@@ -1,5 +1,6 @@
 
 import base64
+import collections
 import difflib
 import hashlib
 import html
@@ -19,10 +20,11 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, quote
 
 import pandas as pd
+import numpy as np
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageFilter
 
 try:
     from google.api_core.exceptions import AlreadyExists, NotFound
@@ -134,6 +136,16 @@ def load_catalog():
 
 catalog = load_catalog()
 catalog_records = catalog.to_dict("records")
+
+MATERIAL_TOKEN_FREQ = collections.Counter()
+for _rec in catalog_records:
+    _tokens = set(
+        norm(_rec.get("StoneType","")).split()
+        + norm(_rec.get("Source Color Name","")).split()
+    )
+    for _tok in _tokens:
+        if len(_tok) >= 4 and _tok not in MATERIAL_GENERIC:
+            MATERIAL_TOKEN_FREQ[_tok] += 1
 
 def row_for_sku(sku):
     target = str(sku or "").upper().strip()
@@ -362,6 +374,18 @@ def token_material_score(clean_text, material_name):
         score = max(score, .96)
     if distinctive and distinctive_ratio == 1 and len(distinctive) >= 2:
         score = max(score, .97)
+
+    rare_hits = [
+        tok for tok in distinctive
+        if tok in at and MATERIAL_TOKEN_FREQ.get(tok, 999) <= 4
+    ]
+    if rare_hits:
+        rarest = min(MATERIAL_TOKEN_FREQ.get(tok, 999) for tok in rare_hits)
+        rarity_floor = {1: .88, 2: .82, 3: .76, 4: .71}.get(rarest, .68)
+        score = max(score, rarity_floor)
+    if len(rare_hits) >= 2:
+        score = max(score, .94)
+
     return min(.995, score)
 
 def filename_material_candidates(filename, limit=8):
@@ -870,6 +894,7 @@ def sync_one_website_record(record, links, build_visual):
     bundled = bundled_reference_entry(record["SKU"])
     resolved_urls = []
     refs = []
+    visual_signatures = []
     errors = []
 
     if bundled and bundled.get("references"):
@@ -879,6 +904,9 @@ def sync_one_website_record(record, links, build_visual):
             try:
                 image_bytes, ctype, resolved_url = download_reference_candidates(bundled, ref_row)
                 resolved_urls.append(resolved_url)
+                sig = _signature_vector(image_bytes)
+                if sig:
+                    visual_signatures.append(sig)
                 if build_visual:
                     refs.append(
                         create_reference_from_bytes(
@@ -904,9 +932,17 @@ def sync_one_website_record(record, links, build_visual):
                     if len(resolved_urls) >= MAX_GOOGLE_REFERENCES_PER_MATERIAL:
                         break
                     try:
+                        image_bytes, ctype = download_reference_image(img["url"])
                         resolved_urls.append(img["url"])
+                        sig = _signature_vector(image_bytes)
+                        if sig:
+                            visual_signatures.append(sig)
                         if build_visual:
-                            refs.append(create_reference_for_url(record, img["url"], len(refs) + 1))
+                            refs.append(
+                                create_reference_from_bytes(
+                                    record, image_bytes, ctype, len(refs) + 1, img["url"]
+                                )
+                            )
                     except Exception as e:
                         errors.append(f"page:{str(e)[:150]}")
             except Exception as e:
@@ -929,6 +965,7 @@ def sync_one_website_record(record, links, build_visual):
         "reference_objects": refs,
         "website_skus": website_skus,
         "reference_source": "ProductExport spreadsheet / direct website asset" if resolved_urls and bundled else "website page fallback",
+        "visual_signatures": visual_signatures,
         "errors": errors[:5],
     }
 
@@ -998,6 +1035,146 @@ def website_reference_bytes(sku):
             pass
     return None
 
+
+# ---------------- immediate local slab-reference similarity ----------------
+
+def _signature_vector(image_bytes):
+    try:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        im.thumbnail((256, 256))
+        hsv = np.asarray(im.convert("HSV"), dtype=np.uint8)
+        gray_im = im.convert("L")
+        gray = np.asarray(gray_im, dtype=np.uint8)
+        edges = np.asarray(gray_im.filter(ImageFilter.FIND_EDGES), dtype=np.uint8)
+
+        parts = []
+        for channel, bins in ((0,18), (1,8), (2,8)):
+            h, _ = np.histogram(hsv[:, :, channel], bins=bins, range=(0,256))
+            h = h.astype(np.float32)
+            h /= max(float(h.sum()), 1.0)
+            parts.append(h)
+
+        gh, _ = np.histogram(gray, bins=16, range=(0,256))
+        gh = gh.astype(np.float32)
+        gh /= max(float(gh.sum()), 1.0)
+        parts.append(gh)
+
+        eh, _ = np.histogram(edges, bins=16, range=(0,256))
+        eh = eh.astype(np.float32)
+        eh /= max(float(eh.sum()), 1.0)
+        parts.append(eh)
+
+        edge_flat = edges.reshape(-1).astype(np.float32)
+        texture = np.array([
+            edge_flat.mean()/255.0,
+            edge_flat.std()/255.0,
+            np.percentile(edge_flat, 75)/255.0,
+            np.percentile(edge_flat, 90)/255.0,
+        ], dtype=np.float32)
+        parts.append(texture)
+
+        vec = np.concatenate(parts).astype(np.float32)
+        n = float(np.linalg.norm(vec))
+        if n <= 1e-8:
+            return []
+        return (vec / n).tolist()
+    except Exception:
+        return []
+
+def _query_region_bytes(image_bytes):
+    regions = [("full", image_bytes)]
+    try:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        w, h = im.size
+        boxes = [
+            ("center", (int(w*.12), int(h*.08), int(w*.88), int(h*.90))),
+            ("upper", (0, 0, w, int(h*.68))),
+            ("lower", (0, int(h*.32), w, h)),
+            ("left", (0, int(h*.08), int(w*.68), int(h*.92))),
+            ("right", (int(w*.32), int(h*.08), w, int(h*.92))),
+        ]
+        for name, box in boxes:
+            if box[2] <= box[0] + 80 or box[3] <= box[1] + 80:
+                continue
+            crop = im.crop(box)
+            buf = io.BytesIO()
+            crop.save(buf, format="JPEG", quality=88)
+            regions.append((name, buf.getvalue()))
+    except Exception:
+        pass
+    return regions
+
+def _cosine_from_lists(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    av = np.asarray(a, dtype=np.float32)
+    bv = np.asarray(b, dtype=np.float32)
+    return float(np.clip(np.dot(av, bv), 0.0, 1.0))
+
+def _calibrate_reference_similarity(raw):
+    return float(np.clip((raw - .68) / .28, 0.0, 1.0))
+
+def local_reference_search(image_bytes, limit=10):
+    cache = load_website_cache()
+    materials = cache.get("materials", {})
+    if not materials:
+        return []
+
+    qvectors = []
+    for region, b in _query_region_bytes(image_bytes):
+        sig = _signature_vector(b)
+        if sig:
+            qvectors.append((region, sig))
+    if not qvectors:
+        return []
+
+    ranked = []
+    for sku, entry in materials.items():
+        sigs = entry.get("visual_signatures", [])
+        if not sigs:
+            continue
+        best_raw = 0.0
+        best_region = "full"
+        for qregion, qsig in qvectors:
+            for rsig in sigs:
+                raw = _cosine_from_lists(qsig, rsig)
+                if raw > best_raw:
+                    best_raw = raw
+                    best_region = qregion
+
+        score = _calibrate_reference_similarity(best_raw)
+        if score <= 0:
+            continue
+        rec = row_for_sku(sku)
+        if not rec:
+            continue
+        ranked.append({
+            "stone": rec["StoneType"],
+            "sku": rec["SKU"],
+            "source_name": rec["Source Color Name"],
+            "score": score,
+            "raw_similarity": best_raw,
+            "query_region": best_region,
+            "source": "Immediate GENROSE reference similarity",
+        })
+
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+    return ranked[:limit]
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def candidate_swatch_bytes(sku):
+    b = website_reference_bytes(sku)
+    if b:
+        return b
+    entry = bundled_reference_entry(sku)
+    for ref in entry.get("references", [])[:3]:
+        try:
+            b, _ctype, _url = download_reference_candidates(entry, ref)
+            return b
+        except Exception:
+            continue
+    return None
+
 # ---------------- analysis hierarchy ----------------
 
 def candidate_by_stone(candidates, stone):
@@ -1007,7 +1184,7 @@ def candidate_by_stone(candidates, stone):
             return c
     return None
 
-def combine_material_evidence(filename_candidates, web_candidates, product_results, website_cache):
+def combine_material_evidence(filename_candidates, web_candidates, product_results, local_results, website_cache):
     """Conservative material ranking.
 
     Rules:
@@ -1023,7 +1200,7 @@ def combine_material_evidence(filename_candidates, web_candidates, product_resul
     for c in filename_candidates:
         union.setdefault(c["sku"], {
             "stone": c["stone"], "sku": c["sku"], "source_name": c["source_name"],
-            "filename": 0.0, "vision_text": 0.0, "visual": 0.0
+            "filename": 0.0, "vision_text": 0.0, "visual": 0.0, "local_visual": 0.0
         })
         union[c["sku"]]["filename"] = max(union[c["sku"]]["filename"], float(c["score"]))
 
@@ -1034,9 +1211,16 @@ def combine_material_evidence(filename_candidates, web_candidates, product_resul
     for c in product_results:
         union.setdefault(c["sku"], {
             "stone": c["stone"], "sku": c["sku"], "source_name": c["source_name"],
-            "filename": 0.0, "vision_text": 0.0, "visual": 0.0
+            "filename": 0.0, "vision_text": 0.0, "visual": 0.0, "local_visual": 0.0
         })
         union[c["sku"]]["visual"] = max(union[c["sku"]]["visual"], float(c["score"]))
+
+    for c in local_results:
+        union.setdefault(c["sku"], {
+            "stone": c["stone"], "sku": c["sku"], "source_name": c["source_name"],
+            "filename": 0.0, "vision_text": 0.0, "visual": 0.0, "local_visual": 0.0
+        })
+        union[c["sku"]]["local_visual"] = max(union[c["sku"]]["local_visual"], float(c["score"]))
 
     for sku, x in union.items():
         if sku in web_by_sku:
@@ -1049,45 +1233,40 @@ def combine_material_evidence(filename_candidates, web_candidates, product_resul
         f = x["filename"]
         vt = x["vision_text"]
         vis = x["visual"]
+        local_vis = x.get("local_visual", 0.0)
+        best_visual = max(vis, local_vis)
         web_verified = website_materials.get(str(sku), {}).get("status") == "OK"
 
-        # Strong filename: treat as authoritative.
+        # Strong filename: authoritative.
         if f >= .90:
             final = min(.995, .92 * f + (.05 if web_verified else 0) + .03 * min(vt, .9))
             method = "Filename"
             if web_verified:
-                method += " + GENROSE verification"
-            if vis >= .55:
+                method += " + GENROSE reference"
+            if best_visual >= .55:
                 final = min(.995, final + .02)
                 method += " + visual confirmation"
 
-        # Medium filename: require corroboration for a strong result.
         elif f >= .70:
-            if vis >= .55:
-                final = min(.94, .62 * f + .30 * vis + (.06 if web_verified else 0) + .02 * min(vt, .9))
-                method = "Filename + Product Search"
-                if web_verified:
-                    method += " + GENROSE verification"
+            if best_visual >= .55:
+                final = min(.95, .62 * f + .28 * best_visual + (.07 if web_verified else 0) + .03 * min(vt, .9))
+                method = "Filename + GENROSE visual reference"
             elif web_verified:
                 final = min(.89, .86 * f + .08 + .03 * min(vt, .9))
-                method = "Filename + GENROSE verification"
+                method = "Filename + GENROSE reference"
             else:
-                final = min(.79, f)
+                final = min(.81, f)
                 method = "Filename · review recommended"
 
-        # Weak filename: Product Search can suggest, but must be genuinely strong.
         else:
-            if vis >= .82:
-                final = min(.90, .88 * vis + .04 * f + (.04 if web_verified else 0))
-                method = "Product Search fallback"
-                if web_verified:
-                    method += " + GENROSE verification"
-            elif vis >= .68:
-                final = min(.76, .82 * vis + .06 * f)
-                method = "Product Search candidate · review required"
+            if best_visual >= .86:
+                final = min(.91, .88 * best_visual + .05 * f + (.04 if web_verified else 0))
+                method = "GENROSE visual reference fallback"
+            elif best_visual >= .62:
+                final = min(.79, .78 * best_visual + .08 * f + (.03 if web_verified else 0))
+                method = "GENROSE visual candidate · review required"
             else:
-                # Do not turn vague Vision terms into "Red", "White", etc.
-                final = min(.49, max(f, vis * .60))
+                final = min(.54, max(f, best_visual * .65))
                 method = "Insufficient material evidence"
 
         results.append({
@@ -1110,8 +1289,11 @@ def analyze_image(filename, image_bytes):
     vision_materials = vision_text_material_candidates(vision_data, 8)
 
     top_filename = filename_materials[0]["score"] if filename_materials else 0
-    # Product Search is the only image-based material fallback.
-    # Generic Vision labels/web entities are never allowed to name a slab.
+
+    # Immediate comparison against references created by the sync.
+    local_results = local_reference_search(image_bytes, 10) if top_filename < .93 else []
+
+    # Google Product Search remains an additional cloud visual signal.
     product_results = []
     if top_filename < .90 and product_search_ready():
         try:
@@ -1121,7 +1303,7 @@ def analyze_image(filename, image_bytes):
 
     website_cache = load_website_cache()
     material_ranked = combine_material_evidence(
-        filename_materials, vision_materials, product_results, website_cache
+        filename_materials, vision_materials, product_results, local_results, website_cache
     )
     best = material_ranked[0] if material_ranked else {
         "stone": "", "sku": "", "confidence": 0, "method": "Unmatched",
@@ -1165,6 +1347,7 @@ def analyze_image(filename, image_bytes):
         "filename_material_score": int(round(best["filename"] * 100)),
         "vision_text_score": int(round(best["vision_text"] * 100)),
         "visual_score": int(round(best["visual"] * 100)),
+        "local_visual_score": int(round(best.get("local_visual", 0) * 100)),
         "website_verified": bool(best["website_verified"]),
         "room": room,
         "room_confidence": int(round(room_conf * 100)),
@@ -1778,6 +1961,20 @@ div[data-testid="stVerticalBlockBorderWrapper"] .stButton>button[kind="primary"]
   .gr-tooltag{display:none;}
   h1{font-size:2.25rem!important;}
 }
+
+.gr-reference-panel{
+  background:#fff;border:1px solid var(--gr-line);
+  display:grid;grid-template-columns:1.4fr repeat(3,.62fr);
+  margin:1.1rem 0 .8rem;
+}
+.gr-ref-lead,.gr-ref-stat{padding:14px 16px;border-right:1px solid var(--gr-line)}
+.gr-ref-stat:last-child{border-right:0}
+.gr-ref-lead strong{display:block;font-family:Georgia,serif;font-size:1.15rem;font-weight:400;margin-bottom:3px}
+.gr-ref-lead span,.gr-ref-stat span{color:#777176!important;font-size:.76rem}
+.gr-ref-stat b{display:block;font-family:Georgia,serif;font-size:1.42rem;font-weight:400;color:#292929}
+.gr-minihead{color:#7c706c!important;text-transform:uppercase;letter-spacing:.12em;font-size:.66rem;font-weight:700;margin:.9rem 0 .45rem}
+.gr-current-choice{background:#f3ece8;border-left:3px solid #9b7c72;padding:9px 10px;margin:.45rem 0 .7rem}
+
 </style>
 """
 
@@ -2109,15 +2306,49 @@ st.markdown('<div class="gr-kicker">INTERNAL IMAGE OPERATIONS</div>', unsafe_all
 st.title("Room Scene Analyzer")
 st.markdown(
     '<div class="gr-lede">Upload manufacturer room scenes and get a proposed material, SKU, room type and production-ready filename. '
-    'Filename intelligence is the primary material source. Google Vision is used for room classification, while uncertain slab matches are left for review instead of being guessed.</div>',
+    'Filename intelligence is checked first. When it is incomplete, the analyzer compares the room scene against the synced GENROSE slab reference library and surfaces visual candidates with swatches for quick correction.</div>',
     unsafe_allow_html=True
 )
 website_cache = load_website_cache()
 website_count = sum(1 for x in website_cache.get("materials", {}).values() if x.get("status") == "OK")
+signature_count = sum(1 for x in website_cache.get("materials", {}).values() if x.get("visual_signatures"))
+bundled_total, bundled_with_refs, bundled_files = bundled_reference_stats()
+
+st.markdown(
+    f'<div class="gr-reference-panel">'
+    f'<div class="gr-ref-lead"><strong>GENROSE Slab Reference Library</strong>'
+    f'<span>Sync once to build swatches and the immediate visual matcher used when filenames are weak.</span></div>'
+    f'<div class="gr-ref-stat"><span>Mapped</span><b>{bundled_with_refs}/{bundled_total}</b></div>'
+    f'<div class="gr-ref-stat"><span>Downloaded</span><b>{website_count}</b></div>'
+    f'<div class="gr-ref-stat"><span>Visual index</span><b>{signature_count}</b></div>'
+    f'</div>',
+    unsafe_allow_html=True
+)
+ref_left, ref_right = st.columns([.76,.24])
+with ref_left:
+    if website_cache.get("synced_at"):
+        st.caption("Last reference sync · " + website_cache["synced_at"][:19].replace("T"," "))
+    else:
+        st.caption("Reference library has not been synced with this build yet.")
+with ref_right:
+    if st.button("SYNC / REFRESH REFERENCES", type="primary", use_container_width=True):
+        if not storage_ready():
+            st.error("Google Cloud Storage must be configured before references can be synced.")
+        else:
+            try:
+                synced = sync_genrose_website(build_visual=product_search_ready())
+                ok = sum(1 for x in synced["materials"].values() if x.get("status") == "OK")
+                sigs = sum(1 for x in synced["materials"].values() if x.get("visual_signatures"))
+                st.success(f"Reference sync complete · {ok} materials downloaded · {sigs} ready for immediate visual matching.")
+                if product_search_ready():
+                    st.info("Immediate reference matching works now. Google Product Search may take longer to index the same images.")
+                st.rerun()
+            except Exception as e:
+                st.exception(e)
 
 with st.sidebar:
-    st.header("Admin")
-    if st.button("🧹 Clear Batch", use_container_width=True):
+    st.header("Controls")
+    if st.button("CLEAR CURRENT BATCH", use_container_width=True):
         st.session_state.pending = []
         st.session_state.results = []
         st.session_state.review_url = ""
@@ -2126,45 +2357,11 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.subheader("Connections")
-    if vision_ready():
-        st.success("Cloud Vision credentials: LOADED")
-        st.caption("A real API call is tested during analysis. If the API is disabled in that Google project, local filename matching still continues.")
-    else:
-        st.error("Cloud Vision credentials: NOT CONFIGURED")
-    if storage_ready():
-        st.success("Cloud Storage: READY")
-    else:
-        st.warning("Cloud Storage: NOT CONFIGURED")
-    if product_search_ready():
-        st.success("Visual Product Search: READY")
-    else:
-        st.warning("Visual Product Search: NOT CONFIGURED")
-
-    st.divider()
-    st.subheader("Reference Catalog")
-    bundled_total, bundled_with_refs, bundled_files = bundled_reference_stats()
-    st.write(f"Spreadsheet materials: **{bundled_with_refs} / {bundled_total}** with slab-image filenames")
-    st.caption(f"{bundled_files} clean slab-image filename candidates bundled from ProductExport_08-17-2026.xlsx")
-    st.write(f"Synced references: **{website_count} / {len(catalog_records)}**")
-    if website_cache.get("synced_at"):
-        st.caption("Last sync: " + website_cache["synced_at"][:19].replace("T", " "))
-
-    if st.button("SYNC GENROSE SLAB REFERENCES", use_container_width=True):
-        if not (storage_ready() and product_search_ready()):
-            st.error("Configure Google Cloud Storage and Product Search first.")
-        else:
-            try:
-                synced = sync_genrose_website(build_visual=True)
-                ok = sum(1 for x in synced["materials"].values() if x.get("status") == "OK")
-                st.success(f"Reference sync complete: {ok} materials resolved.")
-                st.info("Google Product Search indexing is asynchronous. New visual references can take time before they affect matching.")
-                st.rerun()
-            except Exception as e:
-                st.exception(e)
-
-    st.divider()
-    st.caption("You should rarely need this panel after setup. Material corrections are made directly in the Match panel.")
+    st.subheader("System Status")
+    st.write("Cloud Vision", "✅" if vision_ready() else "⚠️")
+    st.write("Cloud Storage", "✅" if storage_ready() else "⚠️")
+    st.write("Product Search", "✅" if product_search_ready() else "⚠️")
+    st.caption("Reference syncing and daily workflow controls are on the main screen.")
 
 st.markdown('<div class="gr-sectionbar">01 · Add Room Scenes</div>', unsafe_allow_html=True)
 uploads = st.file_uploader(
@@ -2186,10 +2383,10 @@ if uploads:
 pending = st.session_state.pending
 
 if pending and not st.session_state.results:
+    st.markdown('<div class="gr-sectionbar">02 · Analyze</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="ds-shell"><div class="gr-sectionbar">02 · Analyze</div>'
-        f'<div style="font-size:1.15rem;font-weight:800">{len(pending)} images loaded</div>'
-        f'<div class="gr-meta">Filename parsing runs first. Google Vision is enrichment/fallback, not the only matching method.</div></div>',
+        f'<div class="gr-current-choice"><strong>{len(pending)} images ready</strong><br>'
+        f'<span class="gr-meta">Filename → room classification → GENROSE reference comparison → review candidates.</span></div>',
         unsafe_allow_html=True
     )
     if not vision_ready():
@@ -2204,7 +2401,7 @@ if pending and not st.session_state.results:
             except Exception as e:
                 analysis = {
                     "stone": "", "sku": "", "material_confidence": 0, "material_method": f"ERROR: {e}",
-                    "filename_material_score": 0, "vision_text_score": 0, "visual_score": 0,
+                    "filename_material_score": 0, "vision_text_score": 0, "visual_score": 0, "local_visual_score": 0,
                     "website_verified": False, "room": "Other", "room_confidence": 0,
                     "room_method": "Error", "room_candidates": [], "material_candidates": [], "vision": {"error": str(e)}
                 }
@@ -2307,10 +2504,10 @@ if st.session_state.review_url:
     st.warning("If another person gets a Streamlit access screen, the app itself is private. Use Streamlit Share → Make this app public, or invite that reviewer by email.")
 
 st.markdown('<div class="gr-rule"></div>', unsafe_allow_html=True)
-left, center, right = st.columns([0.95, 1.55, 1.05], gap="large")
+left, center, right = st.columns([0.78, 1.38, 1.22], gap="large")
 
 with left:
-    with st.container(border=True, height=720):
+    with st.container(border=True, height=860):
         st.subheader("Queue")
         q = st.text_input("Search scenes", placeholder="Search filename, material, SKU or room", label_visibility="collapsed")
         for i, x in enumerate(results):
@@ -2334,7 +2531,7 @@ item = results[idx]
 analysis = item["analysis"]
 
 with center:
-    with st.container(border=True, height=720):
+    with st.container(border=True, height=860):
         st.subheader("Preview")
         st.image(Image.open(io.BytesIO(item["bytes"])), use_container_width=True)
         st.caption(item["name"])
@@ -2343,27 +2540,21 @@ with center:
             f'<div class="gr-statusline">'
             f'<span class="gr-chip {cls}">Material {analysis["material_confidence"]}%</span>'
             f'<span class="gr-chip info">Room {analysis["room_confidence"]}%</span>'
+            f'<span class="gr-chip info">Reference {analysis.get("local_visual_score",0)}%</span>'
             f'<span class="gr-chip info">{html.escape(analysis["material_method"])}</span>'
             f'</div>',
             unsafe_allow_html=True
         )
 
 with right:
-    with st.container(border=True, height=820):
-        st.subheader("Match")
-
+    with st.container(border=True, height=980):
+        st.subheader("Review + Correct")
         filename_key = f"main_filename_{idx}"
 
-        # ORIGINAL NAME FIRST so the user can compare before touching anything.
-        st.markdown('<div class="gr-label">ORIGINAL FILENAME</div>', unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="gr-filename">{html.escape(item["name"])}</div>',
-            unsafe_allow_html=True
-        )
+        st.markdown('<div class="gr-minihead">Original filename</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="gr-filename">{html.escape(item["name"])}</div>', unsafe_allow_html=True)
 
-        st.markdown('<div class="gr-rule"></div>', unsafe_allow_html=True)
-
-        # Searchable canonical material list.
+        st.markdown('<div class="gr-minihead">1 · Material</div>', unsafe_allow_html=True)
         stone_options = ["Needs Review"] + catalog["StoneType"].astype(str).tolist()
         current_stone = item.get("stone") if item.get("stone") in stone_options else "Needs Review"
         material_key = f"main_material_{idx}"
@@ -2371,46 +2562,77 @@ with right:
             st.session_state[material_key] = current_stone
 
         selected_stone = st.selectbox(
-            "Material",
+            "Choose material",
             stone_options,
             key=material_key,
-            help="Start typing to search all canonical materials."
+            help="Type any part of the material name to search the full master list."
         )
-
         if selected_stone != current_stone:
             set_item_material(item, selected_stone, "Manual material selection", filename_key)
             st.rerun()
 
-        # Optional custom material/SKU when it is not in the master list.
-        with st.expander("Material not in the list?", expanded=False):
-            cm1, cm2 = st.columns([1.2, .8])
-            custom_material = cm1.text_input(
-                "Custom material",
-                key=f"custom_material_{idx}",
-                placeholder="Material name"
+        current_swatch = candidate_swatch_bytes(item.get("sku","")) if item.get("sku") else None
+        if current_swatch:
+            sw1, sw2 = st.columns([.34,.66])
+            with sw1:
+                st.image(Image.open(io.BytesIO(current_swatch)), use_container_width=True)
+            with sw2:
+                st.markdown(
+                    f'<div class="gr-current-choice"><strong>{html.escape(item["stone"] or "Needs Review")}</strong><br>'
+                    f'<span class="gr-meta">SKU · {html.escape(item["sku"] or "NEED-SKU")} · '
+                    f'{analysis["material_confidence"]}% confidence</span></div>',
+                    unsafe_allow_html=True
+                )
+        else:
+            st.markdown(
+                f'<div class="gr-current-choice"><strong>{html.escape(item["stone"] or "Needs Review")}</strong><br>'
+                f'<span class="gr-meta">SKU · {html.escape(item["sku"] or "NEED-SKU")} · '
+                f'{analysis["material_confidence"]}% confidence</span></div>',
+                unsafe_allow_html=True
             )
-            custom_sku = cm2.text_input(
-                "Base SKU",
-                key=f"custom_sku_{idx}",
-                placeholder="SKU"
-            )
+
+        material_candidates = analysis.get("material_candidates", [])[:5]
+        if material_candidates:
+            st.markdown('<div class="gr-minihead">Suggested material alternatives</div>', unsafe_allow_html=True)
+            for j, c in enumerate(material_candidates):
+                sw = candidate_swatch_bytes(c["sku"])
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([.22,.54,.24], gap="small")
+                    with c1:
+                        if sw:
+                            st.image(Image.open(io.BytesIO(sw)), use_container_width=True)
+                        else:
+                            st.caption("No swatch")
+                    with c2:
+                        st.markdown(f"**{c['stone']}**")
+                        st.caption(
+                            f"{c['sku']} · {int(round(c['confidence']*100))}% · "
+                            f"filename {int(round(c['filename']*100))}% · "
+                            f"reference {int(round(c.get('local_visual',0)*100))}%"
+                        )
+                    with c3:
+                        if st.button("USE", key=f"use_material_candidate_{idx}_{j}", type="primary", use_container_width=True):
+                            st.session_state[material_key] = c["stone"]
+                            set_item_material(item, c["stone"], "Selected material candidate", filename_key)
+                            st.rerun()
+
+        with st.expander("Material not in the master list?", expanded=False):
+            cm1, cm2 = st.columns([1.2,.8])
+            custom_material = cm1.text_input("Custom material", key=f"custom_material_{idx}", placeholder="Material name")
+            custom_sku = cm2.text_input("Base SKU", key=f"custom_sku_{idx}", placeholder="SKU")
             if st.button("USE CUSTOM MATERIAL", key=f"use_custom_material_{idx}", use_container_width=True):
                 if custom_material.strip():
                     set_item_custom_material(item, custom_material, custom_sku, filename_key)
                     st.session_state[material_key] = "Needs Review"
                     st.rerun()
 
-        # Room selector.
+        st.markdown('<div class="gr-minihead">2 · Room type</div>', unsafe_allow_html=True)
         room_key = f"main_room_{idx}"
         current_room = item.get("room") if item.get("room") in ROOM_TYPES else "Other"
         if room_key not in st.session_state:
             st.session_state[room_key] = current_room
 
-        selected_room = st.selectbox(
-            "Room type",
-            ROOM_TYPES,
-            key=room_key
-        )
+        selected_room = st.selectbox("Choose room type", ROOM_TYPES, key=room_key)
         if selected_room == "Other":
             custom_room = st.text_input(
                 "Custom room type",
@@ -2427,17 +2649,21 @@ with right:
             set_item_room(item, corrected_room, filename_key)
             st.rerun()
 
-        st.markdown(
-            f'<div class="gr-titleline"><div>'
-            f'<div class="gr-result-title">{html.escape(item["stone"] or "Needs Review")}</div>'
-            f'<div class="gr-meta">SKU · {html.escape(item["sku"] or "NEED-SKU")} &nbsp;&nbsp; Room · {html.escape(item["room"])}</div>'
-            f'</div></div>',
-            unsafe_allow_html=True
-        )
-        if item.get("manual_material"):
-            st.markdown('<span class="gr-chip good">Manually confirmed material</span>', unsafe_allow_html=True)
+        room_candidates = [
+            rc for rc in analysis.get("room_candidates", [])[:4]
+            if rc.get("room") and rc.get("room") != item.get("room")
+        ]
+        if room_candidates:
+            st.markdown('<div class="gr-minihead">Suggested room alternatives</div>', unsafe_allow_html=True)
+            rcols = st.columns(min(len(room_candidates),3))
+            for j, rc in enumerate(room_candidates):
+                with rcols[j % len(rcols)]:
+                    if st.button(rc["room"], key=f"use_room_candidate_{idx}_{j}", use_container_width=True):
+                        st.session_state[room_key] = rc["room"] if rc["room"] in ROOM_TYPES else "Other"
+                        set_item_room(item, rc["room"], filename_key)
+                        st.rerun()
 
-        # Editable full output filename.
+        st.markdown('<div class="gr-minihead">3 · Output filename</div>', unsafe_allow_html=True)
         generated_name = item.get("generated_name") or proposed_filename(
             item.get("sku") or "NEED-SKU",
             item.get("stone") or "UnknownMaterial",
@@ -2447,111 +2673,41 @@ with right:
         if filename_key not in st.session_state:
             st.session_state[filename_key] = item.get("new_name") or generated_name
 
-        st.markdown('<div class="gr-label">NEW FILENAME · EDITABLE</div>', unsafe_allow_html=True)
         edited_filename = st.text_input(
-            "New filename",
+            "Editable output filename",
             key=filename_key,
             label_visibility="collapsed",
-            help="Edit the complete output filename directly."
+            help="This is the final filename. You can edit any part of it directly."
         )
         cleaned_filename = normalize_output_filename(edited_filename, item.get("ext") or ".jpg") or generated_name
         item["custom_filename"] = cleaned_filename
         item["manual_filename"] = cleaned_filename != generated_name
         item["new_name"] = cleaned_filename
 
-        nf1, nf2 = st.columns([1, 1])
-        if nf1.button("RESET GENERATED NAME", key=f"reset_filename_{idx}", use_container_width=True):
-            clear_manual_filename(item, filename_key)
-            st.session_state[filename_key] = generated_name
-            st.rerun()
-        nf2.caption("Manual edit" if item.get("manual_filename") else "Using generated name")
+        out1, out2 = st.columns([.62,.38])
+        with out1:
+            st.caption(f"Current · {item['stone'] or 'Needs Review'} / {item['room']}")
+        with out2:
+            if st.button("RESET NAME", key=f"reset_filename_{idx}", use_container_width=True):
+                clear_manual_filename(item, filename_key)
+                st.session_state[filename_key] = generated_name
+                st.rerun()
 
-        st.markdown('<div class="gr-rule"></div>', unsafe_allow_html=True)
-        st.markdown('<div class="gr-label">WHY THIS MATCH</div>', unsafe_allow_html=True)
+        with st.expander("Why did it choose this?", expanded=False):
+            st.write(f"Filename evidence: **{analysis['filename_material_score']}%**")
+            st.write(f"Immediate GENROSE reference: **{analysis.get('local_visual_score',0)}%**")
+            st.write(f"Google Product Search: **{analysis['visual_score']}%**")
+            st.write(f"Room confidence: **{analysis['room_confidence']}%**")
+            st.caption(analysis["room_method"])
 
-        evidence_html = (
-            '<div class="gr-evidence"><span>Filename evidence</span><strong>' + str(analysis["filename_material_score"]) + '%</strong></div>'
-            '<div class="gr-evidence"><span>Google Vision evidence</span><strong>' + str(analysis["vision_text_score"]) + '%</strong></div>'
-        )
-        if analysis["visual_score"]:
-            evidence_html += '<div class="gr-evidence"><span>Visual similarity</span><strong>' + str(analysis["visual_score"]) + '%</strong></div>'
-        evidence_html += (
-            '<div class="gr-evidence"><span>GENROSE reference</span><strong>' +
-            ('Verified' if analysis["website_verified"] else 'Not cached') + '</strong></div>'
-        )
-        st.markdown(evidence_html, unsafe_allow_html=True)
-        st.markdown(f'<div class="gr-note">{html.escape(analysis["room_method"])}</div>', unsafe_allow_html=True)
-
-        # Selectable room candidates.
-        if analysis.get("room_candidates"):
-            with st.expander("Room-type candidates", expanded=False):
-                for j, rc in enumerate(analysis["room_candidates"][:4]):
-                    c1, c2 = st.columns([1.5, .55])
-                    with c1:
-                        st.write(f"**{rc['room']}** · evidence weight {rc.get('weight', 0):.1f}")
-                        if rc.get("reasons"):
-                            st.caption(" · ".join(rc["reasons"][:3]))
-                    with c2:
-                        if st.button(
-                            f"USE {rc['room']}",
-                            key=f"use_room_candidate_{idx}_{j}",
-                            use_container_width=True
-                        ):
-                            st.session_state[room_key] = rc["room"] if rc["room"] in ROOM_TYPES else "Other"
-                            set_item_room(item, rc["room"], filename_key)
-                            st.rerun()
-
-        st.markdown("**GENROSE Reference**")
-        sw = website_reference_bytes(item.get("sku",""))
-        if sw:
-            st.image(Image.open(io.BytesIO(sw)), width=240)
-        else:
-            st.markdown(
-                '<div class="gr-empty">No GENROSE reference image is cached for this material yet.</div>',
-                unsafe_allow_html=True
-            )
-        web_entry = website_entry_for_sku(item.get("sku",""))
-        if web_entry.get("page_url"):
-            st.link_button("OPEN GENROSE MATERIAL PAGE", web_entry["page_url"])
-
-        # Selectable alternate material matches.
-        with st.expander("Alternate material matches", expanded=False):
-            for j, c in enumerate(analysis.get("material_candidates", [])[:6]):
-                c1, c2 = st.columns([1.55, .45])
-                with c1:
-                    st.write(
-                        f"**{c['stone']}** · `{c['sku']}` — {int(round(c['confidence']*100))}%"
-                    )
-                    st.caption(
-                        f"filename {int(round(c['filename']*100))}% · "
-                        f"Vision text {int(round(c['vision_text']*100))}% · "
-                        f"visual {int(round(c['visual']*100))}% · {c['method']}"
-                    )
-                with c2:
-                    if st.button(
-                        f"USE",
-                        key=f"use_material_candidate_{idx}_{j}",
-                        use_container_width=True
-                    ):
-                        st.session_state[material_key] = c["stone"]
-                        set_item_material(item, c["stone"], "Selected alternate material", filename_key)
-                        st.rerun()
-
-        with st.expander("Diagnostics · Google Vision", expanded=False):
+        with st.expander("Advanced diagnostics", expanded=False):
             v = analysis["vision"]
             if v.get("error"):
-                st.warning("Google Cloud Vision did not run for this image. Filename + room-name analysis was preserved.")
+                st.warning("Google Cloud Vision did not run for this image.")
                 st.code(v["error"][:500])
-            st.write("**Best guess:**", ", ".join(v.get("best_guess", [])[:10]) or "—")
-            st.write("**Labels:**", ", ".join(v.get("labels", [])[:20]) or "—")
-            st.write("**Objects:**", ", ".join(v.get("objects", [])[:20]) or "—")
-            st.write("**Web entities:**", ", ".join(v.get("web_entities", [])[:15]) or "—")
-            if v.get("web_pages"):
-                st.write("**Matching web pages:**")
-                for u in v["web_pages"][:5]:
-                    st.caption(u)
-            if v.get("text"):
-                st.text(v["text"][:1200])
+            st.write("Best guess:", ", ".join(v.get("best_guess", [])[:10]) or "—")
+            st.write("Labels:", ", ".join(v.get("labels", [])[:20]) or "—")
+            st.write("Objects:", ", ".join(v.get("objects", [])[:20]) or "—")
 
 st.markdown('<div class="gr-rule"></div>', unsafe_allow_html=True)
 st.markdown('<div class="gr-sectionbar">04 · Export</div>', unsafe_allow_html=True)

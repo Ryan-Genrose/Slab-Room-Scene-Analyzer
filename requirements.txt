@@ -6,3 +6,5 @@ beautifulsoup4>=4.12
 google-cloud-vision>=3.10
 google-cloud-storage>=2.18
 google-auth>=2.35
+
+numpy>=1.26
