@@ -1,6 +1,10 @@
-# DEPLOYMENT GUIDE — GENROSE Room Scene Analyzer v0.9.2
+# DEPLOYMENT GUIDE — GENROSE Room Scene Analyzer v0.9.3
 
 You do not need to install Python locally. Everything can be done in a browser.
+
+## v0.9.3 upgrade notes
+
+No new secrets, APIs, or Python packages are required. Replace the deployed project files with this version and reboot the Streamlit app. Existing Google Cloud Storage review batches remain compatible. New review batches additionally save `analyst_note` and an autosaved `draft.json`.
 
 ---
 
@@ -14,8 +18,8 @@ You do not need to install Python locally. Everything can be done in a browser.
 5. Choose **Private** if you do not want the code public.
 6. Click **Create repository**.
 7. On the empty repository page, click **uploading an existing file**.
-8. Unzip the downloaded `Slab_Room_Scene_Manager_v0.9.2.zip`.
-9. Open the folder `Slab_Room_Scene_Manager_v0.9.2`.
+8. Unzip the downloaded `Slab_Room_Scene_Manager_v0.9.3.zip`.
+9. Open the folder `Slab_Room_Scene_Manager_v0.9.3`.
 10. Drag everything INSIDE that folder into GitHub.
     The GitHub repository root should directly contain:
     - `app.py`

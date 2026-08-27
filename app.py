@@ -1668,7 +1668,8 @@ def save_review_batch(items):
                     }
                     for c in item["analysis"].get("room_candidates", [])[:4]
                 ],
-                "website_url": website_entry_for_sku(item["sku"]).get("page_url", "")
+                "website_url": website_entry_for_sku(item["sku"]).get("page_url", ""),
+                "analyst_note": str(item.get("analyst_note", "") or "")
             })
         bucket.blob(f"review_batches/{batch_id}/review.json").upload_from_string(
             json.dumps(payload, indent=2), content_type="application/json"
@@ -1708,7 +1709,8 @@ def save_review_batch(items):
                     }
                     for c in item["analysis"].get("room_candidates", [])[:4]
                 ],
-                "website_url": website_entry_for_sku(item["sku"]).get("page_url", "")
+                "website_url": website_entry_for_sku(item["sku"]).get("page_url", ""),
+                "analyst_note": str(item.get("analyst_note", "") or "")
             })
         (folder / "review.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -1739,9 +1741,62 @@ def save_submission(batch_id, submission):
             f"review_batches/{batch_id}/submission.json"
         ).upload_from_string(json.dumps(submission, indent=2), content_type="application/json")
     else:
-        (LOCAL_REVIEW_ROOT / batch_id / "submission.json").write_text(
+        folder = LOCAL_REVIEW_ROOT / batch_id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "submission.json").write_text(
             json.dumps(submission, indent=2), encoding="utf-8"
         )
+
+
+def load_submission(batch_id):
+    """Load a completed reviewer submission when one exists."""
+    if storage_ready():
+        try:
+            blob = storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(
+                f"review_batches/{batch_id}/submission.json"
+            )
+            if not blob.exists():
+                return None
+            return json.loads(blob.download_as_text())
+        except Exception:
+            return None
+    p = LOCAL_REVIEW_ROOT / batch_id / "submission.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    except Exception:
+        return None
+
+
+def save_review_draft(batch_id, draft):
+    """Persist in-progress review choices so browser refreshes do not wipe the batch."""
+    payload = copy.deepcopy(draft)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if storage_ready():
+        storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(
+            f"review_batches/{batch_id}/draft.json"
+        ).upload_from_string(json.dumps(payload, indent=2), content_type="application/json")
+    else:
+        folder = LOCAL_REVIEW_ROOT / batch_id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "draft.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_review_draft(batch_id):
+    if storage_ready():
+        try:
+            blob = storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(
+                f"review_batches/{batch_id}/draft.json"
+            )
+            if not blob.exists():
+                return None
+            return json.loads(blob.download_as_text())
+        except Exception:
+            return None
+    p = LOCAL_REVIEW_ROOT / batch_id / "draft.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    except Exception:
+        return None
 
 # ---------------- email ----------------
 
@@ -2596,6 +2651,11 @@ def clear_manual_filename(item, widget_key=None):
         st.session_state.pop(widget_key, None)
 
 def set_item_material(item, stone_name, source="Manual material selection", filename_key=None):
+    """Update material metadata without destroying an intentionally edited filename.
+
+    Auto filenames are synchronized separately. If the user has put the filename in
+    MANUAL mode, material/room corrections leave that filename alone until RESET NAME.
+    """
     if not stone_name or stone_name == "Needs Review":
         item["stone"] = ""
         item["sku"] = ""
@@ -2611,7 +2671,7 @@ def set_item_material(item, stone_name, source="Manual material selection", file
             item["analysis"]["material_method"] = source
             item["manual_material"] = True
             item["decision_status"] = "CONFIRMED"
-    clear_manual_filename(item, filename_key)
+
 
 def set_item_custom_material(item, stone_name, sku, filename_key=None):
     stone_name = re.sub(r"[^A-Za-z0-9]+", "", str(stone_name or "").strip())
@@ -2623,14 +2683,13 @@ def set_item_custom_material(item, stone_name, sku, filename_key=None):
         item["analysis"]["material_method"] = "Manual custom material"
         item["manual_material"] = True
         item["decision_status"] = "NEW_MATERIAL"
-        clear_manual_filename(item, filename_key)
+
 
 def set_item_room(item, room_name, filename_key=None):
     room_name = re.sub(r"[^A-Za-z0-9]+", "", str(room_name or "").strip()) or "Other"
     item["room"] = room_name
     item["analysis"]["room_confidence"] = 100
     item["analysis"]["room_method"] = "Manual room selection"
-    clear_manual_filename(item, filename_key)
 
 
 def mark_item_needs_input(item, filename_key=None):
@@ -2644,7 +2703,175 @@ def mark_item_needs_input(item, filename_key=None):
 
 def mark_item_new_material(item, filename_key=None):
     item["decision_status"] = "NEW_MATERIAL"
-    clear_manual_filename(item, filename_key)
+
+
+def set_state_value(key, value):
+    """Safe Streamlit callback helper. Callbacks run before widgets are recreated."""
+    st.session_state[key] = value
+
+
+def mark_filename_manual(manual_key):
+    st.session_state[manual_key] = True
+
+
+def reset_state_filename(filename_key, generated_key, manual_key):
+    st.session_state[manual_key] = False
+    st.session_state[filename_key] = st.session_state.get(generated_key, "")
+
+
+def mark_main_needs_input(item_index, material_key, filename_key):
+    results = st.session_state.get("results", [])
+    if not (0 <= item_index < len(results)):
+        return
+    mark_item_needs_input(results[item_index], filename_key)
+    st.session_state[material_key] = "Needs Review"
+
+
+def save_main_custom_material(item_index, material_key, custom_material_key, custom_sku_key, show_key, notice_key):
+    results = st.session_state.get("results", [])
+    if not (0 <= item_index < len(results)):
+        return
+    stone = str(st.session_state.get(custom_material_key, "") or "").strip()
+    sku = str(st.session_state.get(custom_sku_key, "") or "").strip()
+    if not stone:
+        st.session_state[notice_key] = "Enter a material name first."
+        return
+    set_item_custom_material(results[item_index], stone, sku)
+    st.session_state[material_key] = "Needs Review"
+    st.session_state[show_key] = False
+    st.session_state[notice_key] = ""
+
+
+def mark_main_filename_manual(item_index, filename_key):
+    results = st.session_state.get("results", [])
+    if not (0 <= item_index < len(results)):
+        return
+    item = results[item_index]
+    ext = item.get("ext") or ".jpg"
+    value = normalize_output_filename(st.session_state.get(filename_key, ""), ext)
+    item["manual_filename"] = True
+    item["custom_filename"] = value
+    item["new_name"] = value or item.get("generated_name", "")
+
+
+def reset_main_filename(item_index, filename_key, generated_key):
+    results = st.session_state.get("results", [])
+    if not (0 <= item_index < len(results)):
+        return
+    item = results[item_index]
+    generated = st.session_state.get(generated_key) or item.get("generated_name", "")
+    item["manual_filename"] = False
+    item.pop("custom_filename", None)
+    item["new_name"] = generated
+    st.session_state[filename_key] = generated
+
+
+def review_decision_map(payload):
+    return {
+        str(d.get("old_filename", "")): d
+        for d in (payload or {}).get("decisions", [])
+        if d.get("old_filename")
+    }
+
+
+def preflight_results(items):
+    """Return blocking export issues plus lighter warnings."""
+    blockers = []
+    warnings = []
+    names = collections.defaultdict(list)
+    for i, item in enumerate(items):
+        final_name = normalize_output_filename(item.get("new_name", ""), item.get("ext") or ".jpg")
+        label = item.get("name") or f"Item {i+1}"
+        if not final_name:
+            blockers.append(f"{label}: final filename is empty.")
+        else:
+            names[final_name.lower()].append(label)
+            original_ext = (item.get("ext") or Path(label).suffix or ".jpg").lower()
+            if Path(final_name).suffix.lower() != original_ext:
+                blockers.append(f"{label}: final extension must remain {original_ext}; ZIP export renames but does not transcode images.")
+        if not item.get("stone"):
+            blockers.append(f"{label}: material still needs input.")
+        if not item.get("sku"):
+            blockers.append(f"{label}: SKU is missing.")
+        if (item.get("room") or "Other") == "Other":
+            warnings.append(f"{label}: room type is Other.")
+        if item.get("decision_status") in {"NEEDS_FURTHER_INPUT", "NEEDS_REVIEW"}:
+            blockers.append(f"{label}: decision is still marked {item.get('decision_status')}.")
+    for _, labels in names.items():
+        if len(labels) > 1:
+            blockers.append("Duplicate final filename: " + " / ".join(labels))
+    # De-duplicate while preserving order.
+    blockers = list(dict.fromkeys(blockers))
+    warnings = list(dict.fromkeys(warnings))
+    return blockers, warnings
+
+
+def renamed_images_zip(items):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for item in items:
+            name = normalize_output_filename(item.get("new_name", ""), item.get("ext") or ".jpg")
+            if name:
+                zf.writestr(name, item["bytes"])
+    return out.getvalue()
+
+
+def submission_dataframe(submission):
+    rows = []
+    for d in (submission or {}).get("decisions", []):
+        rows.append({
+            "Old Filename": d.get("old_filename", ""),
+            "Final Filename": d.get("final_filename", ""),
+            "Suggested Material": d.get("suggested_material", ""),
+            "Final Material": d.get("final_material", ""),
+            "Final SKU": d.get("final_sku", ""),
+            "Final Room": d.get("final_room", ""),
+            "Decision Status": d.get("decision_status", ""),
+            "Approved": "YES" if d.get("approved") else "NO",
+            "Analyst Note": d.get("analyst_note", ""),
+            "Reviewer Note": d.get("reviewer_note", d.get("notes", "")),
+        })
+    return pd.DataFrame(rows)
+
+
+def apply_submission_to_results(submission):
+    """Round-trip a completed review back into the currently loaded analyzer batch."""
+    by_name = review_decision_map(submission)
+    results = st.session_state.get("results", [])
+    applied = 0
+    for i, item in enumerate(results):
+        d = by_name.get(item.get("name", ""))
+        if not d:
+            continue
+        item["stone"] = d.get("final_material", "") or ""
+        item["sku"] = d.get("final_sku", "") or ""
+        item["room"] = d.get("final_room", "") or "Other"
+        item["decision_status"] = d.get("decision_status", "CONFIRMED")
+        item["reviewer_note"] = d.get("reviewer_note", d.get("notes", "")) or ""
+        item["reviewed_by"] = submission.get("reviewer", "")
+        if item.get("analysis") is not None:
+            if item["stone"] and item["sku"]:
+                item["analysis"]["material_confidence"] = 100
+                item["analysis"]["material_method"] = "Reviewer confirmed / corrected"
+            else:
+                item["analysis"]["material_confidence"] = 0
+                item["analysis"]["material_method"] = "Reviewer marked needs input"
+            if item["room"]:
+                item["analysis"]["room_confidence"] = 100
+                item["analysis"]["room_method"] = "Reviewer confirmed / corrected"
+        final_filename = normalize_output_filename(d.get("final_filename", ""), item.get("ext") or ".jpg")
+        if final_filename:
+            item["new_name"] = final_filename
+            item["custom_filename"] = final_filename
+            item["manual_filename"] = True
+        # Clear widget state so the current canonical values rehydrate cleanly on rerun.
+        for key in (
+            f"main_material_{i}", f"main_room_{i}", f"main_custom_room_{i}",
+            f"main_filename_{i}", f"main_generated_{i}", f"main_analyst_note_{i}"
+        ):
+            st.session_state.pop(key, None)
+        applied += 1
+    return applied
 
 def render_review_page(batch_id):
     inject_genrose_styles()
@@ -2662,20 +2889,31 @@ def render_review_page(batch_id):
         st.caption("Create a fresh review link from the analyzer. If another person is opening it, the Streamlit app must be public or that viewer must be invited.")
         st.stop()
 
+    completed = load_submission(batch_id)
+    draft = load_review_draft(batch_id)
+    seed_payload = draft or completed or {}
+    seed_map = review_decision_map(seed_payload)
+
     st.markdown('<div class="gr-kicker">ROOM SCENE REVIEW</div>', unsafe_allow_html=True)
     st.title("Approve Room Scenes")
     st.markdown(
         f'<div class="gr-lede">Batch {html.escape(batch_id)} · Compare every original filename against the proposed result. '
-        'Everything below is editable before submission.</div>',
+        'Material choices update the SKU, GENROSE reference and generated filename automatically. Everything remains editable before submission.</div>',
         unsafe_allow_html=True
     )
+    if completed:
+        who = completed.get("reviewer") or "Reviewer"
+        st.success(f"This batch was already submitted by {who}. You can still inspect or revise it and submit again if needed.")
+    elif draft:
+        st.info("An autosaved review draft was restored for this batch.")
 
+    progress_placeholder = st.empty()
     decisions = []
     stone_options = catalog["StoneType"].astype(str).tolist()
 
     for i, item in enumerate(batch["items"]):
+        seed = seed_map.get(item.get("old_name", ""), {})
         with st.container(border=True):
-            # Original filename is intentionally first and full-width.
             st.markdown('<div class="gr-label">ORIGINAL FILENAME</div>', unsafe_allow_html=True)
             st.markdown(
                 f'<div class="gr-filename">{html.escape(item["old_name"])}</div>',
@@ -2689,6 +2927,10 @@ def render_review_page(batch_id):
                 if b:
                     st.image(Image.open(io.BytesIO(b)), use_container_width=True)
                 st.caption(f"Proposed confidence · Material {item['material_confidence']}% · Room {item['room_confidence']}%")
+                analyst_note = str(item.get("analyst_note", "") or "").strip()
+                if analyst_note:
+                    st.markdown('<div class="gr-label">ANALYST NOTE</div>', unsafe_allow_html=True)
+                    st.info(analyst_note)
 
             with info_col:
                 suggested_stone = item.get("stone") or ""
@@ -2697,13 +2939,23 @@ def render_review_page(batch_id):
                 ext = Path(item["old_name"]).suffix.lower() or ".jpg"
 
                 material_options = ["Needs Further Input"] + stone_options + ["➕ New material"]
-                material_default = suggested_stone if suggested_stone in stone_options else "Needs Further Input"
+                material_key = f"review_material_{batch_id}_{i}"
+                seed_status = seed.get("decision_status") or item.get("decision_status", "")
+                if seed_status == "NEW_MATERIAL":
+                    material_default = "➕ New material"
+                elif seed_status == "NEEDS_FURTHER_INPUT":
+                    material_default = "Needs Further Input"
+                else:
+                    seeded_material = seed.get("final_material") or suggested_stone
+                    material_default = seeded_material if seeded_material in stone_options else "Needs Further Input"
+                if material_key not in st.session_state:
+                    st.session_state[material_key] = material_default
+
                 material_choice = st.selectbox(
                     "Material",
                     material_options,
-                    index=material_options.index(material_default),
-                    key=f"review_material_{batch_id}_{i}",
-                    help="Type into the selector to search all canonical materials."
+                    key=material_key,
+                    help="Type into the selector to search all canonical materials. Changing this updates SKU, slab reference and AUTO filename."
                 )
 
                 final_stone = suggested_stone
@@ -2716,11 +2968,17 @@ def render_review_page(batch_id):
                 elif material_choice == "➕ New material":
                     added_new_material = True
                     cc1, cc2 = st.columns([1.2, .8])
+                    custom_material_key = f"review_custom_material_{batch_id}_{i}"
+                    custom_sku_key = f"review_custom_sku_{batch_id}_{i}"
+                    if custom_material_key not in st.session_state:
+                        st.session_state[custom_material_key] = (seed.get("final_material") or suggested_stone) if seed_status == "NEW_MATERIAL" else ""
+                    if custom_sku_key not in st.session_state:
+                        st.session_state[custom_sku_key] = (seed.get("final_sku") or suggested_sku) if seed_status == "NEW_MATERIAL" else ""
                     final_stone = re.sub(
                         r"[^A-Za-z0-9]+", "",
                         cc1.text_input(
                             "Custom material name",
-                            key=f"review_custom_material_{batch_id}_{i}",
+                            key=custom_material_key,
                             placeholder="Exact material name"
                         ).strip()
                     )
@@ -2728,7 +2986,7 @@ def render_review_page(batch_id):
                         r"[^A-Za-z0-9]+", "",
                         cc2.text_input(
                             "SKU",
-                            key=f"review_custom_sku_{batch_id}_{i}",
+                            key=custom_sku_key,
                             placeholder="Base SKU"
                         ).strip()
                     )
@@ -2738,20 +2996,25 @@ def render_review_page(batch_id):
                         final_stone = str(rec["StoneType"])
                         final_sku = str(rec["SKU"])
 
+                sku_display = final_sku or "NEED-SKU"
+                st.caption(f"Current material · {final_stone or 'Needs Further Input'} · SKU {sku_display}")
+
                 room_options = ROOM_TYPES
-                room_default = suggested_room if suggested_room in room_options else "Other"
-                room_choice = st.selectbox(
-                    "Room type",
-                    room_options,
-                    index=room_options.index(room_default),
-                    key=f"review_room_{batch_id}_{i}"
-                )
+                room_key = f"review_room_{batch_id}_{i}"
+                seeded_room = seed.get("final_room") or suggested_room
+                room_default = seeded_room if seeded_room in room_options else "Other"
+                if room_key not in st.session_state:
+                    st.session_state[room_key] = room_default
+                room_choice = st.selectbox("Room type", room_options, key=room_key)
                 if room_choice == "Other":
+                    custom_room_key = f"review_custom_room_{batch_id}_{i}"
+                    if custom_room_key not in st.session_state:
+                        st.session_state[custom_room_key] = seeded_room if seeded_room not in room_options else ""
                     final_room = re.sub(
                         r"[^A-Za-z0-9]+", "",
                         st.text_input(
                             "Custom room type",
-                            key=f"review_custom_room_{batch_id}_{i}",
+                            key=custom_room_key,
                             placeholder="e.g. ReceptionLounge"
                         ).strip()
                     ) or "Other"
@@ -2765,63 +3028,108 @@ def render_review_page(batch_id):
                     ext
                 )
                 filename_key = f"review_filename_{batch_id}_{i}"
+                generated_key = f"review_generated_{batch_id}_{i}"
+                manual_key = f"review_filename_manual_{batch_id}_{i}"
+                previous_generated = st.session_state.get(generated_key)
+                if manual_key not in st.session_state:
+                    seeded_filename = seed.get("final_filename", "")
+                    st.session_state[manual_key] = bool(seeded_filename and seeded_filename != generated_filename)
                 if filename_key not in st.session_state:
-                    st.session_state[filename_key] = item.get("new_name") or generated_filename
+                    st.session_state[filename_key] = seed.get("final_filename") or item.get("new_name") or generated_filename
+                elif previous_generated is not None and previous_generated != generated_filename and not st.session_state.get(manual_key, False):
+                    st.session_state[filename_key] = generated_filename
+                st.session_state[generated_key] = generated_filename
 
                 st.markdown('<div class="gr-label">FINAL OUTPUT FILENAME · EDITABLE</div>', unsafe_allow_html=True)
                 edited_filename = st.text_input(
                     "Final output filename",
                     key=filename_key,
-                    label_visibility="collapsed"
+                    label_visibility="collapsed",
+                    on_change=mark_filename_manual,
+                    args=(manual_key,),
+                    help="AUTO mode follows Material/SKU/Room. Editing this field switches it to MANUAL until Reset Generated Name."
                 )
                 final_filename = normalize_output_filename(edited_filename, ext) or generated_filename
+                filename_mode = "MANUAL" if st.session_state.get(manual_key, False) else "AUTO"
 
                 rc1, rc2 = st.columns(2)
-                if rc1.button("RESET GENERATED NAME", key=f"review_reset_name_{batch_id}_{i}", use_container_width=True):
-                    st.session_state[filename_key] = generated_filename
-                    st.rerun()
-
-                approved = rc2.checkbox(
-                    "Approved",
-                    value=(int(item["material_confidence"]) >= 90 and int(item["room_confidence"]) >= 70),
-                    key=f"review_approve_{batch_id}_{i}"
+                rc1.button(
+                    "RESET GENERATED NAME",
+                    key=f"review_reset_name_{batch_id}_{i}",
+                    use_container_width=True,
+                    on_click=reset_state_filename,
+                    args=(filename_key, generated_key, manual_key)
                 )
+                approve_key = f"review_approve_{batch_id}_{i}"
+                if approve_key not in st.session_state:
+                    st.session_state[approve_key] = bool(seed.get(
+                        "approved",
+                        int(item["material_confidence"]) >= 90 and int(item["room_confidence"]) >= 70
+                    ))
+                approved = rc2.checkbox("Approved", key=approve_key)
+                st.caption(f"Filename mode · {filename_mode}")
 
                 with st.expander("Suggested candidates", expanded=False):
                     mats = item.get("material_candidates", [])
                     rooms = item.get("room_candidates", [])
                     if mats:
-                        st.markdown("**Material candidates**")
-                        for c in mats:
-                            st.write(f"{c.get('stone')} · `{c.get('sku')}` · {c.get('confidence',0)}%")
+                        st.markdown("**Material candidates — click USE to select**")
+                        for j, c in enumerate(mats):
+                            sw = candidate_swatch_bytes(c.get("sku", ""))
+                            with st.container(border=True):
+                                ca, cb, cc = st.columns([.22, .56, .22], gap="small")
+                                with ca:
+                                    if sw:
+                                        st.image(Image.open(io.BytesIO(sw)), use_container_width=True)
+                                    else:
+                                        st.caption("No slab reference")
+                                with cb:
+                                    st.markdown(f"**{html.escape(str(c.get('stone','')))}**")
+                                    st.caption(f"{c.get('sku','')} · {int(c.get('confidence',0))}% confidence")
+                                with cc:
+                                    st.button(
+                                        "USE",
+                                        key=f"review_candidate_{batch_id}_{i}_{j}",
+                                        type="primary",
+                                        use_container_width=True,
+                                        on_click=set_state_value,
+                                        args=(material_key, c.get("stone", ""))
+                                    )
                     if rooms:
                         st.markdown("**Room candidates**")
                         for c in rooms:
                             st.write(f"{c.get('room')} · evidence {c.get('weight',0):.1f}")
 
-                notes = st.text_input(
-                    "Notes",
-                    key=f"review_notes_{batch_id}_{i}",
-                    placeholder="Optional correction / note"
+                reviewer_note_key = f"review_notes_{batch_id}_{i}"
+                if reviewer_note_key not in st.session_state:
+                    st.session_state[reviewer_note_key] = seed.get("reviewer_note", seed.get("notes", "")) or ""
+                reviewer_note = st.text_area(
+                    "Reviewer note",
+                    key=reviewer_note_key,
+                    placeholder="Optional correction, alternate candidates, or context for Marketing",
+                    height=90
                 )
 
             with swatch_col:
                 st.markdown("**GENROSE Reference**")
-                sw = website_reference_bytes(final_sku or item.get("sku",""))
+                sw = website_reference_bytes(final_sku) if final_sku else None
                 if sw:
                     st.image(Image.open(io.BytesIO(sw)), use_container_width=True)
                 else:
-                    st.info("No reference cached.")
-                if item.get("website_url"):
-                    st.link_button("GENROSE PRODUCT PAGE", item["website_url"])
+                    st.info("No strict slab reference cached.")
+                current_website_url = website_entry_for_sku(final_sku).get("page_url", "") if final_sku else ""
+                if current_website_url:
+                    st.link_button("GENROSE PRODUCT PAGE", current_website_url)
 
             decisions.append({
                 "old_filename": item["old_name"],
-                "suggested_filename": item.get("new_name",""),
+                "suggested_filename": item.get("new_name", ""),
                 "final_filename": final_filename,
                 "suggested_material": suggested_stone,
+                "suggested_sku": suggested_sku,
                 "final_material": final_stone,
                 "final_sku": final_sku,
+                "suggested_room": suggested_room,
                 "final_room": final_room,
                 "decision_status": (
                     "NEEDS_FURTHER_INPUT" if material_choice == "Needs Further Input"
@@ -2832,10 +3140,44 @@ def render_review_page(batch_id):
                 "room_confidence": item["room_confidence"],
                 "approved": approved,
                 "added_new_material": added_new_material,
-                "notes": notes
+                "filename_mode": filename_mode,
+                "analyst_note": str(item.get("analyst_note", "") or ""),
+                "reviewer_note": reviewer_note,
+                "notes": reviewer_note,
             })
 
-    reviewer = st.text_input("Reviewer name", placeholder="Name")
+    approved_count = sum(1 for d in decisions if d["approved"])
+    unresolved_count = sum(1 for d in decisions if d["decision_status"] == "NEEDS_FURTHER_INPUT")
+    changed_count = sum(
+        1 for d in decisions
+        if d["final_material"] != d["suggested_material"]
+        or d["final_room"] != d["suggested_room"]
+        or d["final_filename"] != d["suggested_filename"]
+    )
+    with progress_placeholder.container():
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Scenes", len(decisions))
+        p2.metric("Approved", approved_count)
+        p3.metric("Changed", changed_count)
+        p4.metric("Needs input", unresolved_count)
+
+    reviewer_key = f"review_reviewer_{batch_id}"
+    if reviewer_key not in st.session_state:
+        st.session_state[reviewer_key] = seed_payload.get("reviewer", "") or ""
+    reviewer = st.text_input("Reviewer name", key=reviewer_key, placeholder="Name")
+
+    # Autosave only when the meaningful review payload changes.
+    draft_payload = {"batch_id": batch_id, "reviewer": reviewer, "decisions": decisions}
+    draft_digest = hashlib.sha256(json.dumps(draft_payload, sort_keys=True).encode("utf-8")).hexdigest()
+    digest_key = f"review_draft_digest_{batch_id}"
+    if st.session_state.get(digest_key) != draft_digest:
+        try:
+            save_review_draft(batch_id, draft_payload)
+            st.session_state[digest_key] = draft_digest
+        except Exception as e:
+            st.caption(f"Draft autosave unavailable: {e}")
+
+    st.caption("Review choices are autosaved as you work.")
     if st.button("SUBMIT REVIEW TO MARKETING", type="primary", use_container_width=True):
         missing_custom = [
             d for d in decisions
@@ -2863,13 +3205,14 @@ def render_review_page(batch_id):
                 f"<td>{html.escape(d['final_sku'])}</td>"
                 f"<td>{html.escape(d['final_room'])}</td>"
                 f"<td>{d['material_confidence']}%</td>"
-                f"<td>{html.escape(d['notes'])}</td>"
+                f"<td>{html.escape(d['analyst_note'])}</td>"
+                f"<td>{html.escape(d['reviewer_note'])}</td>"
                 "</tr>"
             )
             text_rows.append(
                 f"{status} | OLD={d['old_filename']} | NEW={d['final_filename']} | "
                 f"MATERIAL={d['final_material']} | SKU={d['final_sku']} | ROOM={d['final_room']} | "
-                f"CONF={d['material_confidence']}% | NOTES={d['notes']}"
+                f"CONF={d['material_confidence']}% | ANALYST={d['analyst_note']} | REVIEWER={d['reviewer_note']}"
             )
 
         subject = f"Room Scene Review — {batch_id}"
@@ -2877,7 +3220,7 @@ def render_review_page(batch_id):
             f"<h2>{html.escape(subject)}</h2><p>Reviewer: {html.escape(reviewer or 'Not supplied')}</p>"
             "<table border='1' cellpadding='6' cellspacing='0'><thead><tr>"
             "<th>Status</th><th>Decision</th><th>Old filename</th><th>Final filename</th><th>Suggested material</th>"
-            "<th>Final material</th><th>SKU</th><th>Room</th><th>Confidence</th><th>Notes</th>"
+            "<th>Final material</th><th>SKU</th><th>Room</th><th>Confidence</th><th>Analyst note</th><th>Reviewer note</th>"
             "</tr></thead><tbody>" + "".join(html_rows) + "</tbody></table>"
         )
         text_body = subject + f"\nReviewer: {reviewer}\n\n" + "\n".join(text_rows)
@@ -3143,7 +3486,9 @@ summary_df = pd.DataFrame([{
     "Material Confidence": f'{x["analysis"]["material_confidence"]}%',
     "Room Confidence": f'{x["analysis"]["room_confidence"]}%',
     "Method": x["analysis"]["material_method"],
-    "Website Verified": "YES" if x["analysis"].get("website_verified") else "NO"
+    "Website Verified": "YES" if x["analysis"].get("website_verified") else "NO",
+    "Analyst Note": x.get("analyst_note", ""),
+    "Reviewer Note": x.get("reviewer_note", "")
 } for x in results])
 
 st.markdown(
@@ -3196,6 +3541,28 @@ if st.session_state.review_url:
     with r2:
         st.caption("Make the Streamlit app public before sending this link outside your account.")
 
+    submitted_review = load_submission(review_id)
+    if submitted_review:
+        reviewer_name = submitted_review.get("reviewer") or "Reviewer"
+        st.success(f"Review submitted by {reviewer_name}. You can apply the approved decisions back to this analyzer batch.")
+        sr1, sr2, sr3 = st.columns([.28, .28, 1], gap="small")
+        with sr1:
+            if st.button("APPLY SUBMITTED REVIEW", type="primary", use_container_width=True):
+                applied = apply_submission_to_results(submitted_review)
+                st.success(f"Applied {applied} reviewed scene(s).")
+                st.rerun()
+        with sr2:
+            submitted_df = submission_dataframe(submitted_review)
+            st.download_button(
+                "DOWNLOAD REVIEW CSV",
+                submitted_df.to_csv(index=False).encode("utf-8-sig"),
+                f"room_scene_review_{review_id}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+    else:
+        st.caption("Review status · Awaiting submission. Draft choices are autosaved on the review page.")
+
 st.markdown('<div class="gr-rule"></div>', unsafe_allow_html=True)
 left, center, right = st.columns([0.78, 1.38, 1.22], gap="large")
 
@@ -3240,7 +3607,7 @@ with center:
         )
 
 with right:
-    with st.container(border=True, height=980):
+    with st.container(border=True, height=1120):
         st.subheader("Review + Correct")
         filename_key = f"main_filename_{idx}"
 
@@ -3290,14 +3657,13 @@ with right:
 
         decision_a, decision_b = st.columns(2, gap="small")
         with decision_a:
-            if st.button(
+            st.button(
                 "CAN'T IDENTIFY · NEED INPUT",
                 key=f"needs_input_{idx}",
-                use_container_width=True
-            ):
-                mark_item_needs_input(item, filename_key)
-                st.session_state[material_key] = "Needs Review"
-                st.rerun()
+                use_container_width=True,
+                on_click=mark_main_needs_input,
+                args=(idx, material_key, filename_key)
+            )
         with decision_b:
             if st.button(
                 "NEW MATERIAL",
@@ -3333,24 +3699,34 @@ with right:
                             f"reference {int(round(c.get('local_visual',0)*100))}%"
                         )
                     with c3:
-                        if st.button("USE", key=f"use_material_candidate_{idx}_{j}", type="primary", use_container_width=True):
-                            st.session_state[material_key] = c["stone"]
-                            set_item_material(item, c["stone"], "Selected material candidate", filename_key)
-                            st.rerun()
+                        st.button(
+                            "USE",
+                            key=f"use_material_candidate_{idx}_{j}",
+                            type="primary",
+                            use_container_width=True,
+                            on_click=set_state_value,
+                            args=(material_key, c["stone"])
+                        )
 
         show_new_material = st.session_state.get(f"show_new_material_{idx}", False) or item.get("decision_status") == "NEW_MATERIAL"
         with st.expander("New / uncataloged material details", expanded=show_new_material):
             cm1, cm2 = st.columns([1.2,.8])
-            custom_material = cm1.text_input("New material name", key=f"custom_material_{idx}", placeholder="Material name")
-            custom_sku = cm2.text_input("Base SKU", key=f"custom_sku_{idx}", placeholder="Leave blank if unknown")
-            if st.button("SAVE NEW MATERIAL", key=f"use_custom_material_{idx}", type="primary", use_container_width=True):
-                if custom_material.strip():
-                    set_item_custom_material(item, custom_material, custom_sku, filename_key)
-                    st.session_state[material_key] = "Needs Review"
-                    st.session_state[f"show_new_material_{idx}"] = False
-                    st.rerun()
-                else:
-                    st.warning("Enter a material name first.")
+            custom_material_key = f"custom_material_{idx}"
+            custom_sku_key = f"custom_sku_{idx}"
+            show_key = f"show_new_material_{idx}"
+            notice_key = f"custom_material_notice_{idx}"
+            cm1.text_input("New material name", key=custom_material_key, placeholder="Material name")
+            cm2.text_input("Base SKU", key=custom_sku_key, placeholder="Leave blank if unknown")
+            st.button(
+                "SAVE NEW MATERIAL",
+                key=f"use_custom_material_{idx}",
+                type="primary",
+                use_container_width=True,
+                on_click=save_main_custom_material,
+                args=(idx, material_key, custom_material_key, custom_sku_key, show_key, notice_key)
+            )
+            if st.session_state.get(notice_key):
+                st.warning(st.session_state[notice_key])
 
         st.markdown('<div class="gr-minihead">2 · Room type</div>', unsafe_allow_html=True)
         room_key = f"main_room_{idx}"
@@ -3384,10 +3760,13 @@ with right:
             rcols = st.columns(min(len(room_candidates),3))
             for j, rc in enumerate(room_candidates):
                 with rcols[j % len(rcols)]:
-                    if st.button(rc["room"], key=f"use_room_candidate_{idx}_{j}", use_container_width=True):
-                        st.session_state[room_key] = rc["room"] if rc["room"] in ROOM_TYPES else "Other"
-                        set_item_room(item, rc["room"], filename_key)
-                        st.rerun()
+                    st.button(
+                        rc["room"],
+                        key=f"use_room_candidate_{idx}_{j}",
+                        use_container_width=True,
+                        on_click=set_state_value,
+                        args=(room_key, rc["room"] if rc["room"] in ROOM_TYPES else "Other")
+                    )
 
         st.markdown('<div class="gr-minihead">3 · Output filename</div>', unsafe_allow_html=True)
         if item.get("decision_status") == "NEEDS_FURTHER_INPUT":
@@ -3399,28 +3778,54 @@ with right:
                 item.get("room") or "Other",
                 item.get("ext") or ".jpg"
             )
+        generated_key = f"main_generated_{idx}"
+        previous_generated = st.session_state.get(generated_key)
         if filename_key not in st.session_state:
-            st.session_state[filename_key] = item.get("new_name") or generated_name
+            st.session_state[filename_key] = item.get("custom_filename") if item.get("manual_filename") else (item.get("new_name") or generated_name)
+        elif previous_generated is not None and previous_generated != generated_name and not item.get("manual_filename"):
+            st.session_state[filename_key] = generated_name
+        st.session_state[generated_key] = generated_name
 
         edited_filename = st.text_input(
             "Editable output filename",
             key=filename_key,
             label_visibility="collapsed",
-            help="This is the final filename. You can edit any part of it directly."
+            help="AUTO follows Material/SKU/Room. Editing this field switches it to MANUAL until Reset Name.",
+            on_change=mark_main_filename_manual,
+            args=(idx, filename_key)
         )
         cleaned_filename = normalize_output_filename(edited_filename, item.get("ext") or ".jpg") or generated_name
-        item["custom_filename"] = cleaned_filename
-        item["manual_filename"] = cleaned_filename != generated_name
-        item["new_name"] = cleaned_filename
+        if item.get("manual_filename"):
+            item["custom_filename"] = cleaned_filename
+            item["new_name"] = cleaned_filename
+        else:
+            item.pop("custom_filename", None)
+            item["new_name"] = generated_name
 
         out1, out2 = st.columns([.62,.38])
         with out1:
-            st.caption(f"Current · {item['stone'] or 'Needs Review'} / {item['room']}")
+            mode = "MANUAL" if item.get("manual_filename") else "AUTO"
+            st.caption(f"{mode} · {item['stone'] or 'Needs Review'} / {item['room']}")
         with out2:
-            if st.button("RESET NAME", key=f"reset_filename_{idx}", use_container_width=True):
-                clear_manual_filename(item, filename_key)
-                st.session_state[filename_key] = generated_name
-                st.rerun()
+            st.button(
+                "RESET NAME",
+                key=f"reset_filename_{idx}",
+                use_container_width=True,
+                on_click=reset_main_filename,
+                args=(idx, filename_key, generated_key)
+            )
+
+        st.markdown('<div class="gr-minihead">4 · Analyst note</div>', unsafe_allow_html=True)
+        analyst_note_key = f"main_analyst_note_{idx}"
+        if analyst_note_key not in st.session_state:
+            st.session_state[analyst_note_key] = str(item.get("analyst_note", "") or "")
+        item["analyst_note"] = st.text_area(
+            "Analyst note",
+            key=analyst_note_key,
+            label_visibility="collapsed",
+            placeholder="Optional note for Cyndi — alternate slab candidates, uncertainty, context, etc.",
+            height=90
+        )
 
         with st.expander("Why did it choose this?", expanded=False):
             st.write(f"Filename evidence: **{analysis['filename_material_score']}%**")
@@ -3450,14 +3855,45 @@ latest_summary_df = pd.DataFrame([{
     "Material Confidence": f'{x["analysis"]["material_confidence"]}%',
     "Room Confidence": f'{x["analysis"]["room_confidence"]}%',
     "Method": x["analysis"]["material_method"],
-    "Website Verified": "YES" if x["analysis"].get("website_verified") else "NO"
+    "Website Verified": "YES" if x["analysis"].get("website_verified") else "NO",
+    "Analyst Note": x.get("analyst_note", ""),
+    "Reviewer Note": x.get("reviewer_note", "")
 } for x in results])
 st.dataframe(latest_summary_df, use_container_width=True, hide_index=True)
-st.download_button(
-    "DOWNLOAD CURRENT CSV",
-    latest_summary_df.to_csv(index=False).encode("utf-8-sig"),
-    "room_scene_analysis_current.csv",
-    "text/csv",
-    use_container_width=True
-)
+
+blockers, preflight_warnings = preflight_results(results)
+st.markdown('<div class="gr-minihead">Production preflight</div>', unsafe_allow_html=True)
+if blockers:
+    st.error(f"{len(blockers)} blocking issue(s) must be resolved before renamed-image export.")
+    for issue in blockers[:10]:
+        st.caption(f"• {issue}")
+    if len(blockers) > 10:
+        st.caption(f"…and {len(blockers)-10} more blocker(s).")
+else:
+    st.success("Preflight passed · filenames are unique and every scene has a material + SKU.")
+if preflight_warnings:
+    with st.expander(f"Preflight warnings ({len(preflight_warnings)})", expanded=False):
+        for issue in preflight_warnings:
+            st.write(f"• {issue}")
+
+ex1, ex2 = st.columns(2, gap="small")
+with ex1:
+    st.download_button(
+        "DOWNLOAD CURRENT CSV",
+        latest_summary_df.to_csv(index=False).encode("utf-8-sig"),
+        "room_scene_analysis_current.csv",
+        "text/csv",
+        use_container_width=True
+    )
+with ex2:
+    if blockers:
+        st.button("DOWNLOAD RENAMED IMAGES ZIP", disabled=True, use_container_width=True, help="Resolve preflight blockers first.")
+    else:
+        st.download_button(
+            "DOWNLOAD RENAMED IMAGES ZIP",
+            renamed_images_zip(results),
+            "room_scenes_renamed.zip",
+            "application/zip",
+            use_container_width=True
+        )
 

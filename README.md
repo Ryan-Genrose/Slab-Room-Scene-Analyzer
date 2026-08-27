@@ -1,4 +1,17 @@
-# GENROSE Room Scene Analyzer v0.9.2
+# GENROSE Room Scene Analyzer v0.9.3
+
+
+## v0.9.3 — Cyndi review workflow patch
+- Fixed the Streamlit state crash on **RESET GENERATED NAME** and **RESET NAME**.
+- Material changes on the Review Page now synchronize **Material → SKU → slab reference → GENROSE product link → generated filename**.
+- Suggested material candidates on the Review Page are now selectable with **USE** buttons.
+- Added **Analyst Note** on the Analyzer and a separate **Reviewer Note** on the approval page.
+- Added AUTO/MANUAL filename behavior so an intentional filename edit is preserved until reset.
+- Added review draft autosave/restore and review progress metrics.
+- Added completed-review round-trip: submitted decisions can be applied back to the current Analyzer batch and downloaded as CSV.
+- Added production preflight for missing material/SKU and duplicate filenames.
+- Added **DOWNLOAD RENAMED IMAGES ZIP** after preflight passes.
+- Fixed the same Streamlit widget-state pattern on main candidate/room selection controls.
 
 ## Daily workflow
 1. Drop a batch of room-scene images.
