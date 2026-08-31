@@ -25,7 +25,7 @@ import numpy as np
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 
 try:
     from google.api_core.exceptions import AlreadyExists, NotFound
@@ -44,6 +44,8 @@ LOCAL_DATA.mkdir(exist_ok=True)
 LOCAL_REVIEW_ROOT = LOCAL_DATA / "review_batches"
 LOCAL_REVIEW_ROOT.mkdir(exist_ok=True)
 LOCAL_WEBSITE_CACHE = LOCAL_DATA / "genrose_website_catalog.json"
+LOCAL_MATERIAL_THUMBNAIL_ROOT = LOCAL_DATA / "material_thumbnails"
+LOCAL_MATERIAL_THUMBNAIL_ROOT.mkdir(exist_ok=True)
 REFERENCE_CATALOG_PATH = ROOT / "data" / "genrose_reference_catalog.json"
 GENROSE_ASSET_BASE = "https://www.genrose.com/Customer-Content/www/Products/TileTypes"
 MAX_GOOGLE_REFERENCES_PER_MATERIAL = 2
@@ -1286,6 +1288,65 @@ def website_reference_bytes(sku):
     return None
 
 
+# ---------------- manual material thumbnails ----------------
+
+def material_thumbnail_object_path(sku):
+    return f"material_thumbnails/{safe_id(str(sku or '').upper())}/thumbnail.jpg"
+
+def local_material_thumbnail_path(sku):
+    return LOCAL_MATERIAL_THUMBNAIL_ROOT / f"{safe_id(str(sku or '').upper())}.jpg"
+
+def normalize_material_thumbnail(image_bytes):
+    """Normalize a user-supplied slab thumbnail to a compact, durable JPEG."""
+    im = Image.open(io.BytesIO(image_bytes))
+    im = ImageOps.exif_transpose(im).convert("RGB")
+    im.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=88, optimize=True)
+    return out.getvalue()
+
+def manual_material_thumbnail_bytes(sku):
+    sku = str(sku or "").strip()
+    if not sku:
+        return None
+    if storage_ready():
+        try:
+            blob = storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(
+                material_thumbnail_object_path(sku)
+            )
+            if blob.exists():
+                return blob.download_as_bytes()
+        except Exception:
+            pass
+    local_path = local_material_thumbnail_path(sku)
+    try:
+        return local_path.read_bytes() if local_path.exists() else None
+    except Exception:
+        return None
+
+def save_manual_material_thumbnail(sku, image_bytes):
+    """Persist a manually supplied material thumbnail by SKU.
+
+    Manual thumbnails are display references only. They are intentionally NOT added
+    to the visual-matching signature library, so a quick human reference image cannot
+    accidentally change analyzer scoring.
+    """
+    sku = str(sku or "").strip()
+    if not sku:
+        raise ValueError("Select a material with a SKU before adding a thumbnail.")
+    normalized = normalize_material_thumbnail(image_bytes)
+    local_material_thumbnail_path(sku).write_bytes(normalized)
+    if storage_ready():
+        storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(
+            material_thumbnail_object_path(sku)
+        ).upload_from_string(normalized, content_type="image/jpeg")
+    return normalized
+
+def material_thumbnail_bytes(sku):
+    """Human-facing thumbnail: manual override first, strict GENROSE slab second."""
+    return manual_material_thumbnail_bytes(sku) or website_reference_bytes(sku)
+
+
 # ---------------- immediate local slab-reference similarity ----------------
 
 def _signature_vector(image_bytes):
@@ -1415,7 +1476,7 @@ def local_reference_search(image_bytes, limit=10):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def candidate_swatch_bytes(sku):
-    return website_reference_bytes(sku)
+    return material_thumbnail_bytes(sku)
 
 
 # ---------------- analysis hierarchy ----------------
@@ -1622,11 +1683,12 @@ def app_base_url():
 
     return "http://localhost:8501"
 
-def save_review_batch(items):
+def save_review_batch(items, analyst_batch_note=""):
     batch_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     payload = {
         "batch_id": batch_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "analyst_batch_note": str(analyst_batch_note or "").strip(),
         "items": []
     }
 
@@ -2901,6 +2963,10 @@ def render_review_page(batch_id):
         'Material choices update the SKU, GENROSE reference and generated filename automatically. Everything remains editable before submission.</div>',
         unsafe_allow_html=True
     )
+    analyst_batch_note = str(batch.get("analyst_batch_note", "") or "").strip()
+    if analyst_batch_note:
+        st.markdown('<div class="gr-label">ANALYST NOTE FOR THIS REVIEW</div>', unsafe_allow_html=True)
+        st.info(analyst_batch_note)
     if completed:
         who = completed.get("reviewer") or "Reviewer"
         st.success(f"This batch was already submitted by {who}. You can still inspect or revise it and submit again if needed.")
@@ -3062,10 +3128,9 @@ def render_review_page(batch_id):
                 )
                 approve_key = f"review_approve_{batch_id}_{i}"
                 if approve_key not in st.session_state:
-                    st.session_state[approve_key] = bool(seed.get(
-                        "approved",
-                        int(item["material_confidence"]) >= 90 and int(item["room_confidence"]) >= 70
-                    ))
+                    # A fresh review must require an explicit human approval click.
+                    # Drafts/submitted reviews keep their previously saved state.
+                    st.session_state[approve_key] = bool(seed["approved"]) if "approved" in seed else False
                 approved = rc2.checkbox("Approved", key=approve_key)
                 st.caption(f"Filename mode · {filename_mode}")
 
@@ -3082,7 +3147,7 @@ def render_review_page(batch_id):
                                     if sw:
                                         st.image(Image.open(io.BytesIO(sw)), use_container_width=True)
                                     else:
-                                        st.caption("No slab reference")
+                                        st.caption("No thumbnail")
                                 with cb:
                                     st.markdown(f"**{html.escape(str(c.get('stone','')))}**")
                                     st.caption(f"{c.get('sku','')} · {int(c.get('confidence',0))}% confidence")
@@ -3112,11 +3177,11 @@ def render_review_page(batch_id):
 
             with swatch_col:
                 st.markdown("**GENROSE Reference**")
-                sw = website_reference_bytes(final_sku) if final_sku else None
+                sw = candidate_swatch_bytes(final_sku) if final_sku else None
                 if sw:
                     st.image(Image.open(io.BytesIO(sw)), use_container_width=True)
                 else:
-                    st.info("No strict slab reference cached.")
+                    st.info("No material thumbnail is available yet.")
                 current_website_url = website_entry_for_sku(final_sku).get("page_url", "") if final_sku else ""
                 if current_website_url:
                     st.link_button("GENROSE PRODUCT PAGE", current_website_url)
@@ -3167,7 +3232,12 @@ def render_review_page(batch_id):
     reviewer = st.text_input("Reviewer name", key=reviewer_key, placeholder="Name")
 
     # Autosave only when the meaningful review payload changes.
-    draft_payload = {"batch_id": batch_id, "reviewer": reviewer, "decisions": decisions}
+    draft_payload = {
+        "batch_id": batch_id,
+        "reviewer": reviewer,
+        "analyst_batch_note": analyst_batch_note,
+        "decisions": decisions
+    }
     draft_digest = hashlib.sha256(json.dumps(draft_payload, sort_keys=True).encode("utf-8")).hexdigest()
     digest_key = f"review_draft_digest_{batch_id}"
     if st.session_state.get(digest_key) != draft_digest:
@@ -3187,7 +3257,12 @@ def render_review_page(batch_id):
             st.error("Enter a material name for every custom-material item.")
             st.stop()
 
-        submission = {"batch_id": batch_id, "reviewer": reviewer, "decisions": decisions}
+        submission = {
+            "batch_id": batch_id,
+            "reviewer": reviewer,
+            "analyst_batch_note": analyst_batch_note,
+            "decisions": decisions
+        }
         save_submission(batch_id, submission)
 
         html_rows = []
@@ -3216,14 +3291,20 @@ def render_review_page(batch_id):
             )
 
         subject = f"Room Scene Review — {batch_id}"
+        batch_note_html = (
+            f"<p><strong>Analyst review note:</strong> {html.escape(analyst_batch_note)}</p>"
+            if analyst_batch_note else ""
+        )
         html_body = (
             f"<h2>{html.escape(subject)}</h2><p>Reviewer: {html.escape(reviewer or 'Not supplied')}</p>"
-            "<table border='1' cellpadding='6' cellspacing='0'><thead><tr>"
+            + batch_note_html
+            + "<table border='1' cellpadding='6' cellspacing='0'><thead><tr>"
             "<th>Status</th><th>Decision</th><th>Old filename</th><th>Final filename</th><th>Suggested material</th>"
             "<th>Final material</th><th>SKU</th><th>Room</th><th>Confidence</th><th>Analyst note</th><th>Reviewer note</th>"
             "</tr></thead><tbody>" + "".join(html_rows) + "</tbody></table>"
         )
-        text_body = subject + f"\nReviewer: {reviewer}\n\n" + "\n".join(text_rows)
+        batch_note_text = f"\nAnalyst review note: {analyst_batch_note}\n" if analyst_batch_note else ""
+        text_body = subject + f"\nReviewer: {reviewer}" + batch_note_text + "\n" + "\n".join(text_rows)
 
         try:
             send_review_email(subject, html_body, text_body)
@@ -3243,6 +3324,7 @@ st.session_state.setdefault("pending", [])
 st.session_state.setdefault("results", [])
 st.session_state.setdefault("selected", 0)
 st.session_state.setdefault("review_url", "")
+st.session_state.setdefault("review_batch_note", "")
 
 inject_genrose_styles()
 render_genrose_brand()
@@ -3324,6 +3406,7 @@ with st.sidebar:
         st.session_state.pending = []
         st.session_state.results = []
         st.session_state.review_url = ""
+        st.session_state.review_batch_note = ""
         st.session_state.selected = 0
         st.session_state.upload_key += 1
         st.rerun()
@@ -3401,6 +3484,8 @@ if pending and not st.session_state.results:
         if clear_pending:
             st.session_state.pending = []
             st.session_state.results = []
+            st.session_state.review_url = ""
+            st.session_state.review_batch_note = ""
             st.session_state.selected = 0
             st.session_state.upload_key += 1
             st.rerun()
@@ -3442,6 +3527,8 @@ if pending and not st.session_state.results:
         time.sleep(.2)
         progress.empty()
         st.session_state.results = results
+        st.session_state.review_url = ""
+        st.session_state.review_batch_note = ""
         st.session_state.selected = 0
         st.rerun()
 
@@ -3506,11 +3593,21 @@ m2.metric("Ready", high)
 m3.metric("Needs review", review)
 m4.metric("References matched", sum(1 for x in results if x["analysis"].get("website_verified")))
 
+st.markdown('<div class="gr-minihead">Note for reviewer</div>', unsafe_allow_html=True)
+st.text_area(
+    "Note for reviewer",
+    key="review_batch_note",
+    label_visibility="collapsed",
+    placeholder="Optional note that will appear at the top of Cyndi's review page — batch-level context, alternate materials to watch for, special instructions, etc.",
+    height=100
+)
+st.caption("This note is saved into the review batch when you create the link. Per-image Analyst Notes still travel with their individual scenes.")
+
 st.markdown('<div class="gr-results-actions">', unsafe_allow_html=True)
 act_spacer, act_review, act_csv = st.columns([1.0,.34,.34], gap="small")
 with act_review:
     if st.button("CREATE REVIEW LINK", type="primary", use_container_width=False):
-        batch_id, url = save_review_batch(results)
+        batch_id, url = save_review_batch(results, st.session_state.get("review_batch_note", ""))
         st.session_state.review_url = url
         st.success("Review page created.")
 with act_csv:
@@ -3645,7 +3742,7 @@ with right:
                 )
         else:
             st.markdown(
-                '<div class="gr-meta" style="margin:.15rem 0 .4rem">No strict <strong>-Slab</strong> reference image is available for this material.</div>',
+                '<div class="gr-meta" style="margin:.15rem 0 .4rem">No material thumbnail is available for this material yet.</div>',
                 unsafe_allow_html=True
             )
             st.markdown(
@@ -3654,6 +3751,35 @@ with right:
                 f'{analysis["material_confidence"]}% confidence</span></div>',
                 unsafe_allow_html=True
             )
+            if item.get("sku"):
+                thumb_sku = str(item.get("sku") or "").strip()
+                thumb_key = f"material_thumb_upload_{idx}_{safe_id(thumb_sku)}"
+                st.markdown('<div class="gr-minihead">Add material thumbnail</div>', unsafe_allow_html=True)
+                uploaded_thumb = st.file_uploader(
+                    "Add material thumbnail",
+                    type=["jpg", "jpeg", "png", "webp"],
+                    key=thumb_key,
+                    label_visibility="collapsed",
+                    help="Upload a slab/reference image for this material. It will appear anywhere this SKU needs a thumbnail, including the review page."
+                )
+                if uploaded_thumb is not None:
+                    try:
+                        st.image(uploaded_thumb, width=180)
+                    except Exception:
+                        pass
+                    if st.button(
+                        "SAVE MATERIAL THUMBNAIL",
+                        key=f"save_material_thumb_{idx}_{safe_id(thumb_sku)}",
+                        type="primary",
+                        use_container_width=True
+                    ):
+                        try:
+                            save_manual_material_thumbnail(thumb_sku, uploaded_thumb.getvalue())
+                            candidate_swatch_bytes.clear()
+                            st.success(f"Thumbnail saved for {item.get('stone') or thumb_sku}.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not save thumbnail: {e}")
 
         decision_a, decision_b = st.columns(2, gap="small")
         with decision_a:
@@ -3690,7 +3816,7 @@ with right:
                         if sw:
                             st.image(Image.open(io.BytesIO(sw)), use_container_width=True)
                         else:
-                            st.caption("No -Slab reference")
+                            st.caption("No thumbnail")
                     with c2:
                         st.markdown(f"**{c['stone']}**")
                         st.caption(
