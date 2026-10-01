@@ -1,7 +1,26 @@
-# GENROSE Room Scene Analyzer v0.9.3
+> **v0.9.8 production email:** Review submissions are saved to Google Cloud first, then notification delivery is audited separately. New live review links require a passing email preflight. See `EMAIL_NOTIFICATION_SETUP.md` for the one-time Google Apps Script setup.
+
+# GENROSE Room Scene Analyzer v0.9.5
+
+## v0.9.6 — reference refresh hang fix
+- Removed the blocking Google Cloud Storage checkpoint from every 20th material.
+- Local checkpoints still occur every 20 records; cloud checkpoints are bounded and non-fatal.
+- A failed cloud save now warns and lets the refresh finish instead of freezing the app.
 
 
-## v0.9.3 — Cyndi review workflow patch
+
+## v0.9.5 — per-scene review notes
+- Removed the batch-level **Note for reviewer** field and the top-of-review-page note block.
+- Each room scene now has its own **Note for reviewer · this scene** field in the Analyzer.
+- Scene notes are persisted directly into the matching result and travel with that exact scene into the Review Page, review CSV, autosaved draft, submission, and email.
+- Moved **CREATE REVIEW LINK** below the scene correction panel so notes/corrections are entered before the review batch is created.
+- Added a final note-state sync before review-link creation/export so switching scenes or other Streamlit reruns cannot drop a note.
+- On the Review Page, an analyst note is displayed inside its individual scene card immediately beneath the original filename.
+- Fresh **Approved** checkboxes remain unchecked by default; restored drafts/submissions retain saved approval choices.
+- Manual material thumbnail upload from v0.9.4 is unchanged.
+
+
+## v0.9.4 — Cyndi review workflow patch
 - Fixed the Streamlit state crash on **RESET GENERATED NAME** and **RESET NAME**.
 - Material changes on the Review Page now synchronize **Material → SKU → slab reference → GENROSE product link → generated filename**.
 - Suggested material candidates on the Review Page are now selectable with **USE** buttons.
@@ -16,8 +35,8 @@
 ## Daily workflow
 1. Drop a batch of room-scene images.
 2. Click **ANALYZE**.
-3. Review the automated matches.
-4. Click **CREATE REVIEW LINK**.
+3. Review the automated matches and add any scene-specific reviewer notes.
+4. Click **CREATE REVIEW LINK** after the scene corrections/notes are complete.
 5. Send the link to the reviewer.
 
 ## Matching hierarchy
@@ -173,3 +192,12 @@ Material matching is now intentionally conservative:
 - Added derived strict-filename probing (`SlabImage` → `-Slab`, plural `-Slabs` → `-Slab`, suffixless export names → `-Slab`) to find strict assets that exist in the same website folder but are not listed directly in the export.
 - Live sync status now reports strict-ready, updated-this-run, previous-preserved, no-strict-image, and error counts.
 - Renamed the confusing `Mapped` stat to `Probeable from export`.
+
+
+## v0.9.4 review-workflow additions
+
+- v0.9.4 introduced a batch-level reviewer note; **v0.9.5 removes that behavior in favor of scene-specific notes only**.
+- Per-image **Analyst Note** fields travel with each individual scene.
+- Added manual material thumbnail upload when the selected material has no existing thumbnail/reference. Thumbnails are stored by SKU, persist in Google Cloud Storage when configured, and automatically appear in Analyzer candidate cards and on the Review Page.
+- Manual thumbnails are display-only and do **not** alter the visual matching/signature library.
+- Fresh review batches now start with every **Approved** checkbox unchecked. Saved drafts/submissions retain the reviewer's previous approval choices.

@@ -35,6 +35,8 @@ try:
 except Exception:
     GOOGLE_LIBS = False
 
+APP_VERSION = "0.9.8"
+
 st.set_page_config(page_title="GENROSE Room Scene Analyzer", page_icon="🪨", layout="wide", initial_sidebar_state="collapsed")
 
 ROOT = Path(__file__).parent
@@ -682,12 +684,30 @@ def load_website_cache():
             pass
     return {"synced_at": "", "materials": {}}
 
-def save_website_cache(cache):
-    LOCAL_WEBSITE_CACHE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-    if storage_ready():
-        storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(website_cache_path()).upload_from_string(
-            json.dumps(cache, indent=2), content_type="application/json"
-        )
+def save_website_cache(cache, cloud=True, cloud_timeout=12):
+    """Persist the website-reference cache without allowing GCS to freeze a refresh.
+
+    Local writes are always attempted first. Cloud writes are bounded and non-fatal so a
+    slow/unavailable bucket cannot stall the scan at a checkpoint. Returns (ok, error).
+    """
+    payload = json.dumps(cache, indent=2)
+    try:
+        LOCAL_WEBSITE_CACHE.write_text(payload, encoding="utf-8")
+    except Exception as e:
+        return False, f"Local cache write failed: {e}"
+
+    if cloud and storage_ready():
+        try:
+            storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(website_cache_path()).upload_from_string(
+                payload,
+                content_type="application/json",
+                timeout=cloud_timeout,
+                retry=None,
+            )
+        except Exception as e:
+            # Keep the refresh moving. The final save gets another bounded attempt.
+            return False, f"Cloud cache checkpoint failed: {type(e).__name__}: {str(e)[:220]}"
+    return True, ""
 
 def fetch_html(url, timeout=20):
     headers = {"User-Agent": "Mozilla/5.0 GENROSE-room-scene-reference-builder/1.0"}
@@ -1228,10 +1248,25 @@ def sync_genrose_website(build_visual=True, max_workers=6):
                 f"**No strict slab:** {no_ref} &nbsp;&nbsp; **Errors:** {errors}"
             )
 
-            # Checkpoint successful merged state. A killed Streamlit run still keeps progress.
+            # Checkpoint successful merged state without blocking on cloud storage.
+            # v0.9.5 performed a synchronous GCS upload every 20 records, which could
+            # make the refresh appear permanently stuck at exactly record 20.
             if done % 20 == 0:
                 cache["refresh_checkpoint_at"] = datetime.now(timezone.utc).isoformat()
-                save_website_cache(cache)
+                cache["refresh_checkpoint_record"] = done
+                # Fast local checkpoint every 20 records. This is enough to protect the
+                # current process and avoids a network round-trip in the hot scan loop.
+                save_website_cache(cache, cloud=False)
+
+            # Less-frequent, bounded cloud checkpoint. Failure is recorded but never
+            # stops the scan; the final save below makes another attempt.
+            if done % 100 == 0:
+                ok, checkpoint_error = save_website_cache(cache, cloud=True, cloud_timeout=10)
+                if not ok and checkpoint_error:
+                    cache["last_cloud_checkpoint_error"] = checkpoint_error
+                    status.caption(
+                        f"Latest: {r['StoneType']} — {latest_status} · cloud checkpoint skipped; scan continuing"
+                    )
 
     cache["synced_at"] = datetime.now(timezone.utc).isoformat()
     cache["refresh_finished_at"] = cache["synced_at"]
@@ -1243,7 +1278,16 @@ def sync_genrose_website(build_visual=True, max_workers=6):
         "errors": errors,
         "strict_ready_total": strict_ready_count(),
     }
-    save_website_cache(cache)
+    final_save_ok, final_save_error = save_website_cache(cache, cloud=True, cloud_timeout=15)
+    if not final_save_ok and final_save_error:
+        cache["final_cloud_save_error"] = final_save_error
+        # Make sure the diagnostic itself survives locally.
+        save_website_cache(cache, cloud=False)
+        st.warning(
+            "Reference scan finished, but the final cloud-cache save did not complete. "
+            "The local cache is intact for this session. You can retry REFRESH LIBRARY later. "
+            f"Details: {final_save_error}"
+        )
     progress.empty()
     status.empty()
     metrics.empty()
@@ -1683,12 +1727,11 @@ def app_base_url():
 
     return "http://localhost:8501"
 
-def save_review_batch(items, analyst_batch_note=""):
+def save_review_batch(items):
     batch_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     payload = {
         "batch_id": batch_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "analyst_batch_note": str(analyst_batch_note or "").strip(),
         "items": []
     }
 
@@ -1860,10 +1903,158 @@ def load_review_draft(batch_id):
     except Exception:
         return None
 
+
+def list_review_batch_index():
+    """Return lightweight review-batch status records without downloading scene images."""
+    records = {}
+    if storage_ready():
+        bucket_name = secret("GOOGLE_CLOUD_BUCKET", "")
+        try:
+            for blob in storage_client().list_blobs(bucket_name, prefix="review_batches/"):
+                parts = blob.name.split("/")
+                if len(parts) < 3 or not parts[1]:
+                    continue
+                batch_id = parts[1]
+                leaf = "/".join(parts[2:])
+                rec = records.setdefault(batch_id, {
+                    "batch_id": batch_id,
+                    "review": False,
+                    "draft": False,
+                    "submission": False,
+                    "notification": False,
+                })
+                if leaf == "review.json":
+                    rec["review"] = True
+                elif leaf == "draft.json":
+                    rec["draft"] = True
+                elif leaf == "submission.json":
+                    rec["submission"] = True
+                elif leaf == "notification.json":
+                    rec["notification"] = True
+        except Exception as e:
+            return [], f"Could not list review batches: {type(e).__name__}: {str(e)[:220]}"
+    else:
+        try:
+            for folder in LOCAL_REVIEW_ROOT.iterdir():
+                if not folder.is_dir():
+                    continue
+                records[folder.name] = {
+                    "batch_id": folder.name,
+                    "review": (folder / "review.json").exists(),
+                    "draft": (folder / "draft.json").exists(),
+                    "submission": (folder / "submission.json").exists(),
+                    "notification": (folder / "notification.json").exists(),
+                }
+        except Exception as e:
+            return [], f"Could not list local review batches: {type(e).__name__}: {str(e)[:220]}"
+
+    rows = []
+    for batch_id, rec in records.items():
+        if rec["submission"]:
+            state = "SUBMITTED"
+        elif rec["draft"]:
+            state = "IN PROGRESS"
+        elif rec["review"]:
+            state = "AWAITING REVIEW"
+        else:
+            state = "INCOMPLETE"
+        rec["state"] = state
+        rows.append(rec)
+    rows.sort(key=lambda x: x["batch_id"], reverse=True)
+    return rows, ""
+
+
 # ---------------- email ----------------
 
-def send_review_email(subject, html_body, text_body):
-    # Option 1: Formspree endpoint configured to deliver to marketing@genrose.com.
+def review_email_recipient():
+    """Destination for review-complete notifications."""
+    return str(secret("REVIEW_EMAIL", REVIEW_EMAIL) or REVIEW_EMAIL).strip()
+
+
+def email_provider_name():
+    if secret("REVIEW_EMAIL_WEBHOOK", "") and secret("REVIEW_EMAIL_WEBHOOK_TOKEN", ""):
+        return "Google Apps Script"
+    if secret("FORMSPREE_ENDPOINT", ""):
+        return "Formspree"
+    if secret("RESEND_API_KEY", "") and secret("EMAIL_FROM", ""):
+        return "Resend"
+    if secret("SMTP_HOST", "") and secret("SMTP_USER", "") and secret("SMTP_PASSWORD", ""):
+        return "SMTP"
+    return "Not configured"
+
+
+def email_configured():
+    return email_provider_name() != "Not configured"
+
+
+def email_preflight():
+    """Verify the preferred Apps Script webhook before a live review link is created."""
+    webhook = str(secret("REVIEW_EMAIL_WEBHOOK", "") or "").strip()
+    token = str(secret("REVIEW_EMAIL_WEBHOOK_TOKEN", "") or "").strip()
+    if webhook or token:
+        if not webhook or not token:
+            return False, "Google Apps Script email requires both REVIEW_EMAIL_WEBHOOK and REVIEW_EMAIL_WEBHOOK_TOKEN."
+        try:
+            r = requests.get(
+                webhook,
+                params={"action": "health", "token": token},
+                timeout=15,
+                allow_redirects=True,
+            )
+            if r.status_code >= 300:
+                return False, f"Email webhook returned HTTP {r.status_code}."
+            try:
+                data = r.json()
+            except Exception:
+                return False, f"Email webhook returned an unexpected response: {r.text[:180]}"
+            if not data.get("ok"):
+                return False, str(data.get("error") or "Email webhook health check failed.")
+            return True, f"Google Apps Script verified · notifications go to {review_email_recipient()}"
+        except Exception as e:
+            return False, f"Email webhook could not be reached: {type(e).__name__}: {str(e)[:180]}"
+
+    # Legacy providers remain supported for existing deployments, but they do not expose
+    # a safe no-send health endpoint. Their credentials are checked for completeness.
+    if email_configured():
+        return True, f"{email_provider_name()} configured · notifications go to {review_email_recipient()}"
+    return False, "Email notifications are not configured. Live review links are disabled until notification delivery is configured."
+
+
+def send_review_email(subject, html_body, text_body, batch_id="", reviewer=""):
+    recipient = review_email_recipient()
+
+    # Preferred production path: a tiny Google Apps Script web app using MailApp.
+    # The deployment URL stays server-side in Streamlit Secrets, and every request
+    # must also carry the shared token configured in Script Properties.
+    webhook = str(secret("REVIEW_EMAIL_WEBHOOK", "") or "").strip()
+    token = str(secret("REVIEW_EMAIL_WEBHOOK_TOKEN", "") or "").strip()
+    if webhook and token:
+        r = requests.post(
+            webhook,
+            json={
+                "token": token,
+                "to": recipient,
+                "subject": subject,
+                "html": html_body,
+                "text": text_body,
+                "batch_id": batch_id,
+                "reviewer": reviewer,
+            },
+            timeout=30,
+            allow_redirects=True,
+            headers={"Content-Type": "application/json", "User-Agent": "GENROSE-Room-Scene-Analyzer/0.9.8"},
+        )
+        if r.status_code >= 300:
+            raise RuntimeError(f"Google Apps Script returned HTTP {r.status_code}: {r.text[:250]}")
+        try:
+            data = r.json()
+        except Exception:
+            raise RuntimeError(f"Google Apps Script returned an unexpected response: {r.text[:250]}")
+        if not data.get("ok"):
+            raise RuntimeError(str(data.get("error") or "Google Apps Script reported an email failure."))
+        return "Google Apps Script"
+
+    # Legacy option 1: Formspree endpoint configured to deliver to the review inbox.
     formspree = secret("FORMSPREE_ENDPOINT", "")
     if formspree:
         r = requests.post(
@@ -1872,16 +2063,16 @@ def send_review_email(subject, html_body, text_body):
                 "_subject": subject,
                 "message": text_body,
                 "html": html_body,
-                "recipient": REVIEW_EMAIL
+                "recipient": recipient
             },
             timeout=30,
             headers={"Accept": "application/json"}
         )
         if r.status_code >= 300:
             raise RuntimeError(f"Formspree returned {r.status_code}: {r.text[:250]}")
-        return
+        return "Formspree"
 
-    # Option 2: Resend
+    # Legacy option 2: Resend.
     resend = secret("RESEND_API_KEY", "")
     sender = secret("EMAIL_FROM", "")
     if resend and sender:
@@ -1890,7 +2081,7 @@ def send_review_email(subject, html_body, text_body):
             headers={"Authorization": f"Bearer {resend}", "Content-Type": "application/json"},
             json={
                 "from": sender,
-                "to": [REVIEW_EMAIL],
+                "to": [recipient],
                 "subject": subject,
                 "html": html_body,
                 "text": text_body
@@ -1899,9 +2090,9 @@ def send_review_email(subject, html_body, text_body):
         )
         if r.status_code >= 300:
             raise RuntimeError(f"Resend returned {r.status_code}: {r.text[:250]}")
-        return
+        return "Resend"
 
-    # Option 3: SMTP
+    # Legacy option 3: SMTP.
     host = secret("SMTP_HOST", "")
     user = secret("SMTP_USER", "")
     password = secret("SMTP_PASSWORD", "")
@@ -1910,18 +2101,187 @@ def send_review_email(subject, html_body, text_body):
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = sender or user
-        msg["To"] = REVIEW_EMAIL
+        msg["To"] = recipient
         msg.set_content(text_body)
         msg.add_alternative(html_body, subtype="html")
         with smtplib.SMTP(host, port, timeout=30) as server:
             server.starttls(context=ssl.create_default_context())
             server.login(user, password)
             server.send_message(msg)
-        return
+        return "SMTP"
 
     raise RuntimeError(
-        "Email isn't configured. Add FORMSPREE_ENDPOINT, or RESEND_API_KEY + EMAIL_FROM, or SMTP secrets."
+        "Email isn't configured. Configure the Google Apps Script webhook in Streamlit Secrets."
     )
+
+
+def notification_status_path(batch_id):
+    return f"review_batches/{batch_id}/notification.json"
+
+
+def save_notification_status(batch_id, status):
+    payload = copy.deepcopy(status or {})
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    raw = json.dumps(payload, indent=2)
+    if storage_ready():
+        storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(
+            notification_status_path(batch_id)
+        ).upload_from_string(raw, content_type="application/json")
+    else:
+        folder = LOCAL_REVIEW_ROOT / batch_id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "notification.json").write_text(raw, encoding="utf-8")
+    return payload
+
+
+def load_notification_status(batch_id):
+    if storage_ready():
+        try:
+            blob = storage_client().bucket(secret("GOOGLE_CLOUD_BUCKET", "")).blob(
+                notification_status_path(batch_id)
+            )
+            if not blob.exists():
+                return None
+            return json.loads(blob.download_as_text())
+        except Exception:
+            return None
+    p = LOCAL_REVIEW_ROOT / batch_id / "notification.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    except Exception:
+        return None
+
+
+def build_review_email(batch_id, submission):
+    decisions = list((submission or {}).get("decisions") or [])
+    reviewer = str((submission or {}).get("reviewer") or "").strip()
+    approved_count = sum(1 for d in decisions if d.get("approved"))
+    rejected_count = len(decisions) - approved_count
+
+    html_rows = []
+    text_rows = []
+    for d in decisions:
+        status = "APPROVED" if d.get("approved") else "NOT APPROVED"
+        html_rows.append(
+            "<tr>"
+            f"<td>{html.escape(status)}</td>"
+            f"<td>{html.escape(str(d.get('decision_status','')))}</td>"
+            f"<td>{html.escape(str(d.get('old_filename','')))}</td>"
+            f"<td>{html.escape(str(d.get('final_filename','')))}</td>"
+            f"<td>{html.escape(str(d.get('suggested_material','')))}</td>"
+            f"<td>{html.escape(str(d.get('final_material','')))}</td>"
+            f"<td>{html.escape(str(d.get('final_sku','')))}</td>"
+            f"<td>{html.escape(str(d.get('final_room','')))}</td>"
+            f"<td>{html.escape(str(d.get('material_confidence','')))}%</td>"
+            f"<td>{html.escape(str(d.get('analyst_note','')))}</td>"
+            f"<td>{html.escape(str(d.get('reviewer_note', d.get('notes',''))))}</td>"
+            "</tr>"
+        )
+        text_rows.append(
+            f"{status} | OLD={d.get('old_filename','')} | NEW={d.get('final_filename','')} | "
+            f"MATERIAL={d.get('final_material','')} | SKU={d.get('final_sku','')} | ROOM={d.get('final_room','')} | "
+            f"CONF={d.get('material_confidence','')}% | ANALYST={d.get('analyst_note','')} | "
+            f"REVIEWER={d.get('reviewer_note', d.get('notes',''))}"
+        )
+
+    subject = (
+        f"Room Scene Review Submitted — {reviewer or 'Reviewer'} — "
+        f"{approved_count}/{len(decisions)} approved"
+    )
+    submitted_at = str((submission or {}).get("submitted_at") or "")
+    batch_note = str((submission or {}).get("analyst_batch_note") or "").strip()
+    batch_note_html = f"<p><strong>Analyst batch note:</strong><br>{html.escape(batch_note).replace(chr(10), '<br>')}</p>" if batch_note else ""
+    html_body = (
+        f"<h2>{html.escape(subject)}</h2>"
+        f"<p><strong>Batch:</strong> {html.escape(batch_id)}<br>"
+        f"<strong>Reviewer:</strong> {html.escape(reviewer or 'Not supplied')}<br>"
+        f"<strong>Approved:</strong> {approved_count} &nbsp; <strong>Not approved:</strong> {rejected_count}<br>"
+        f"<strong>Submitted:</strong> {html.escape(submitted_at or 'Just now')}</p>"
+        + batch_note_html
+        + "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse'>"
+        + "<thead><tr>"
+        "<th>Status</th><th>Decision</th><th>Old filename</th><th>Final filename</th><th>Suggested material</th>"
+        "<th>Final material</th><th>SKU</th><th>Room</th><th>Confidence</th><th>Analyst note</th><th>Reviewer note</th>"
+        "</tr></thead><tbody>" + "".join(html_rows) + "</tbody></table>"
+    )
+    text_body = (
+        subject + "\n"
+        + f"Batch: {batch_id}\nReviewer: {reviewer or 'Not supplied'}\n"
+        + f"Approved: {approved_count} | Not approved: {rejected_count}\n"
+        + (f"Analyst batch note: {batch_note}\n" if batch_note else "")
+        + "\n".join(text_rows)
+    )
+    return subject, html_body, text_body
+
+
+def deliver_review_notification(batch_id, submission, attempts=3):
+    """Send and audit a review-complete email. Never changes the saved submission."""
+    recipient = review_email_recipient()
+    if not email_configured():
+        status = save_notification_status(batch_id, {
+            "status": "NOT_CONFIGURED",
+            "recipient": recipient,
+            "provider": "Not configured",
+            "attempts": 0,
+            "error": "Email notifications are not configured.",
+        })
+        return False, status
+
+    subject, html_body, text_body = build_review_email(batch_id, submission)
+    last_error = ""
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        if attempt > 1:
+            time.sleep(min(4, 1.5 * (2 ** (attempt - 2))))
+        try:
+            provider = send_review_email(
+                subject,
+                html_body,
+                text_body,
+                batch_id=batch_id,
+                reviewer=str((submission or {}).get("reviewer") or ""),
+            )
+            status = save_notification_status(batch_id, {
+                "status": "SENT",
+                "recipient": recipient,
+                "provider": provider,
+                "attempts": attempt,
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "subject": subject,
+            })
+            return True, status
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {str(e)[:500]}"
+
+    status = save_notification_status(batch_id, {
+        "status": "FAILED",
+        "recipient": recipient,
+        "provider": email_provider_name(),
+        "attempts": max(1, int(attempts)),
+        "error": last_error,
+        "subject": subject,
+    })
+    return False, status
+
+
+def send_test_review_notification():
+    ok, message = email_preflight()
+    if not ok:
+        raise RuntimeError(message)
+    now = datetime.now(timezone.utc).isoformat()
+    subject = "GENROSE Room Scene Review — notification test"
+    text_body = (
+        "This is a test notification from the GENROSE Room Scene Analyzer.\n"
+        f"Sent at: {now}\n"
+        "If you received this, review-complete email delivery is configured."
+    )
+    html_body = (
+        "<h2>GENROSE Room Scene Review</h2>"
+        "<p><strong>Email notification test passed.</strong></p>"
+        f"<p>Sent at: {html.escape(now)}</p>"
+        "<p>If you received this, review-complete email delivery is configured.</p>"
+    )
+    provider = send_review_email(subject, html_body, text_body, batch_id="TEST", reviewer="System test")
+    return provider, review_email_recipient()
 
 
 GENROSE_STYLE = r"""
@@ -2772,6 +3132,22 @@ def set_state_value(key, value):
     st.session_state[key] = value
 
 
+def save_main_analyst_note(item_index, note_key):
+    """Persist a scene-specific analyst note into the actual result object."""
+    results = st.session_state.get("results", [])
+    if not (0 <= item_index < len(results)):
+        return
+    results[item_index]["analyst_note"] = str(st.session_state.get(note_key, "") or "")
+
+
+def sync_analyzer_notes_from_state(items):
+    """Pull every visible analyst-note widget into its matching scene before export/review."""
+    for i, item in enumerate(items):
+        note_key = f"main_analyst_note_{i}"
+        if note_key in st.session_state:
+            item["analyst_note"] = str(st.session_state.get(note_key, "") or "")
+
+
 def mark_filename_manual(manual_key):
     st.session_state[manual_key] = True
 
@@ -2897,20 +3273,38 @@ def submission_dataframe(submission):
 
 
 def apply_submission_to_results(submission):
-    """Round-trip a completed review back into the currently loaded analyzer batch."""
+    """Round-trip a completed review back into the current analyzer batch.
+
+    Only reviewer-approved scenes become production results. Rejected scenes retain
+    their analyzer values but are explicitly marked so production exports can omit
+    them while preserving the reviewer note and audit trail.
+    """
     by_name = review_decision_map(submission)
     results = st.session_state.get("results", [])
-    applied = 0
+    approved_applied = 0
+    rejected_marked = 0
     for i, item in enumerate(results):
         d = by_name.get(item.get("name", ""))
         if not d:
             continue
+
+        is_approved = bool(d.get("approved"))
+        item["review_approved"] = is_approved
+        item["reviewer_note"] = d.get("reviewer_note", d.get("notes", "")) or ""
+        item["reviewed_by"] = submission.get("reviewer", "")
+        item["review_submitted_at"] = submission.get("submitted_at", "")
+
+        if not is_approved:
+            # A reviewer rejection means: keep it for audit/history, but do not
+            # mutate it into a production-approved asset and do not export it.
+            item["decision_status"] = "REJECTED_BY_REVIEWER"
+            rejected_marked += 1
+            continue
+
         item["stone"] = d.get("final_material", "") or ""
         item["sku"] = d.get("final_sku", "") or ""
         item["room"] = d.get("final_room", "") or "Other"
         item["decision_status"] = d.get("decision_status", "CONFIRMED")
-        item["reviewer_note"] = d.get("reviewer_note", d.get("notes", "")) or ""
-        item["reviewed_by"] = submission.get("reviewer", "")
         if item.get("analysis") is not None:
             if item["stone"] and item["sku"]:
                 item["analysis"]["material_confidence"] = 100
@@ -2926,14 +3320,21 @@ def apply_submission_to_results(submission):
             item["new_name"] = final_filename
             item["custom_filename"] = final_filename
             item["manual_filename"] = True
+
         # Clear widget state so the current canonical values rehydrate cleanly on rerun.
         for key in (
             f"main_material_{i}", f"main_room_{i}", f"main_custom_room_{i}",
             f"main_filename_{i}", f"main_generated_{i}", f"main_analyst_note_{i}"
         ):
             st.session_state.pop(key, None)
-        applied += 1
-    return applied
+        approved_applied += 1
+
+    return approved_applied, rejected_marked
+
+
+def production_items(items):
+    """Items eligible for production export. Explicit reviewer rejections are omitted."""
+    return [item for item in items if item.get("review_approved") is not False]
 
 def render_review_page(batch_id):
     inject_genrose_styles()
@@ -2963,13 +3364,17 @@ def render_review_page(batch_id):
         'Material choices update the SKU, GENROSE reference and generated filename automatically. Everything remains editable before submission.</div>',
         unsafe_allow_html=True
     )
-    analyst_batch_note = str(batch.get("analyst_batch_note", "") or "").strip()
-    if analyst_batch_note:
-        st.markdown('<div class="gr-label">ANALYST NOTE FOR THIS REVIEW</div>', unsafe_allow_html=True)
-        st.info(analyst_batch_note)
     if completed:
         who = completed.get("reviewer") or "Reviewer"
         st.success(f"This batch was already submitted by {who}. You can still inspect or revise it and submit again if needed.")
+        notify_status = load_notification_status(batch_id) or {}
+        if notify_status.get("status") == "SENT":
+            st.caption(
+                f"Email notification · SENT to {notify_status.get('recipient', review_email_recipient())} "
+                f"via {notify_status.get('provider', email_provider_name())}"
+            )
+        else:
+            st.warning("This submission does not have a confirmed email-delivery record yet. The review itself is safely stored.")
     elif draft:
         st.info("An autosaved review draft was restored for this batch.")
 
@@ -2986,6 +3391,11 @@ def render_review_page(batch_id):
                 unsafe_allow_html=True
             )
 
+            analyst_note = str(item.get("analyst_note", "") or "").strip()
+            if analyst_note:
+                st.markdown('<div class="gr-label">ANALYST NOTE FOR THIS SCENE</div>', unsafe_allow_html=True)
+                st.info(analyst_note)
+
             image_col, info_col, swatch_col = st.columns([1.05, 1.5, .72], gap="large")
 
             with image_col:
@@ -2993,10 +3403,6 @@ def render_review_page(batch_id):
                 if b:
                     st.image(Image.open(io.BytesIO(b)), use_container_width=True)
                 st.caption(f"Proposed confidence · Material {item['material_confidence']}% · Room {item['room_confidence']}%")
-                analyst_note = str(item.get("analyst_note", "") or "").strip()
-                if analyst_note:
-                    st.markdown('<div class="gr-label">ANALYST NOTE</div>', unsafe_allow_html=True)
-                    st.info(analyst_note)
 
             with info_col:
                 suggested_stone = item.get("stone") or ""
@@ -3235,7 +3641,6 @@ def render_review_page(batch_id):
     draft_payload = {
         "batch_id": batch_id,
         "reviewer": reviewer,
-        "analyst_batch_note": analyst_batch_note,
         "decisions": decisions
     }
     draft_digest = hashlib.sha256(json.dumps(draft_payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -3248,7 +3653,7 @@ def render_review_page(batch_id):
             st.caption(f"Draft autosave unavailable: {e}")
 
     st.caption("Review choices are autosaved as you work.")
-    if st.button("SUBMIT REVIEW TO MARKETING", type="primary", use_container_width=True):
+    if st.button("SUBMIT REVIEW", type="primary", use_container_width=True):
         missing_custom = [
             d for d in decisions
             if d["added_new_material"] and not d["final_material"]
@@ -3260,57 +3665,26 @@ def render_review_page(batch_id):
         submission = {
             "batch_id": batch_id,
             "reviewer": reviewer,
-            "analyst_batch_note": analyst_batch_note,
-            "decisions": decisions
+                "decisions": decisions
         }
         save_submission(batch_id, submission)
 
-        html_rows = []
-        text_rows = []
-        for d in decisions:
-            status = "APPROVED" if d["approved"] else "NOT APPROVED"
-            html_rows.append(
-                "<tr>"
-                f"<td>{html.escape(status)}</td>"
-                f"<td>{html.escape(d.get('decision_status',''))}</td>"
-                f"<td>{html.escape(d['old_filename'])}</td>"
-                f"<td>{html.escape(d['final_filename'])}</td>"
-                f"<td>{html.escape(d['suggested_material'])}</td>"
-                f"<td>{html.escape(d['final_material'])}</td>"
-                f"<td>{html.escape(d['final_sku'])}</td>"
-                f"<td>{html.escape(d['final_room'])}</td>"
-                f"<td>{d['material_confidence']}%</td>"
-                f"<td>{html.escape(d['analyst_note'])}</td>"
-                f"<td>{html.escape(d['reviewer_note'])}</td>"
-                "</tr>"
+        # The review itself is already durably saved above. Email is a notification layer,
+        # audited separately so delivery can be retried without touching reviewer decisions.
+        st.success("Review submitted and saved to production storage.")
+        sent, notify_status = deliver_review_notification(batch_id, submission, attempts=3)
+        if sent:
+            st.success(
+                f"Email notification sent to {notify_status.get('recipient', review_email_recipient())} "
+                f"via {notify_status.get('provider', email_provider_name())}."
             )
-            text_rows.append(
-                f"{status} | OLD={d['old_filename']} | NEW={d['final_filename']} | "
-                f"MATERIAL={d['final_material']} | SKU={d['final_sku']} | ROOM={d['final_room']} | "
-                f"CONF={d['material_confidence']}% | ANALYST={d['analyst_note']} | REVIEWER={d['reviewer_note']}"
+        else:
+            st.error(
+                "The review is safely saved, but the email notification did not send. "
+                "Marketing can retry delivery from the Analyzer without asking the reviewer to submit again."
             )
-
-        subject = f"Room Scene Review — {batch_id}"
-        batch_note_html = (
-            f"<p><strong>Analyst review note:</strong> {html.escape(analyst_batch_note)}</p>"
-            if analyst_batch_note else ""
-        )
-        html_body = (
-            f"<h2>{html.escape(subject)}</h2><p>Reviewer: {html.escape(reviewer or 'Not supplied')}</p>"
-            + batch_note_html
-            + "<table border='1' cellpadding='6' cellspacing='0'><thead><tr>"
-            "<th>Status</th><th>Decision</th><th>Old filename</th><th>Final filename</th><th>Suggested material</th>"
-            "<th>Final material</th><th>SKU</th><th>Room</th><th>Confidence</th><th>Analyst note</th><th>Reviewer note</th>"
-            "</tr></thead><tbody>" + "".join(html_rows) + "</tbody></table>"
-        )
-        batch_note_text = f"\nAnalyst review note: {analyst_batch_note}\n" if analyst_batch_note else ""
-        text_body = subject + f"\nReviewer: {reviewer}" + batch_note_text + "\n" + "\n".join(text_rows)
-
-        try:
-            send_review_email(subject, html_body, text_body)
-            st.success(f"Submitted and emailed to {REVIEW_EMAIL}.")
-        except Exception as e:
-            st.warning(f"Review was saved, but email failed: {e}")
+            if notify_status.get("error"):
+                st.caption(f"Email error · {notify_status.get('error')}")
 
 review_param = st.query_params.get("review", "")
 if review_param:
@@ -3324,7 +3698,6 @@ st.session_state.setdefault("pending", [])
 st.session_state.setdefault("results", [])
 st.session_state.setdefault("selected", 0)
 st.session_state.setdefault("review_url", "")
-st.session_state.setdefault("review_batch_note", "")
 
 inject_genrose_styles()
 render_genrose_brand()
@@ -3406,7 +3779,6 @@ with st.sidebar:
         st.session_state.pending = []
         st.session_state.results = []
         st.session_state.review_url = ""
-        st.session_state.review_batch_note = ""
         st.session_state.selected = 0
         st.session_state.upload_key += 1
         st.rerun()
@@ -3485,7 +3857,6 @@ if pending and not st.session_state.results:
             st.session_state.pending = []
             st.session_state.results = []
             st.session_state.review_url = ""
-            st.session_state.review_batch_note = ""
             st.session_state.selected = 0
             st.session_state.upload_key += 1
             st.rerun()
@@ -3528,7 +3899,6 @@ if pending and not st.session_state.results:
         progress.empty()
         st.session_state.results = results
         st.session_state.review_url = ""
-        st.session_state.review_batch_note = ""
         st.session_state.selected = 0
         st.rerun()
 
@@ -3563,21 +3933,6 @@ for x in results:
 high = sum(1 for x in results if x["analysis"]["material_confidence"] >= 90 and x["analysis"]["room_confidence"] >= 70 and bool(x.get("stone")) and bool(x.get("sku")))
 review = len(results) - high
 
-summary_df = pd.DataFrame([{
-    "Old Filename": x["name"],
-    "New Filename": x["new_name"],
-    "Material": x["stone"] or "Needs Review",
-    "SKU": x["sku"] or "NEED-SKU",
-    "Room": x["room"],
-    "Decision Status": x.get("decision_status",""),
-    "Material Confidence": f'{x["analysis"]["material_confidence"]}%',
-    "Room Confidence": f'{x["analysis"]["room_confidence"]}%',
-    "Method": x["analysis"]["material_method"],
-    "Website Verified": "YES" if x["analysis"].get("website_verified") else "NO",
-    "Analyst Note": x.get("analyst_note", ""),
-    "Reviewer Note": x.get("reviewer_note", "")
-} for x in results])
-
 st.markdown(
     '<div class="gr-stephead">'
     '<div class="gr-step-left"><span class="gr-step-no">03</span><div>'
@@ -3592,73 +3947,6 @@ m1.metric("Scenes", len(results))
 m2.metric("Ready", high)
 m3.metric("Needs review", review)
 m4.metric("References matched", sum(1 for x in results if x["analysis"].get("website_verified")))
-
-st.markdown('<div class="gr-minihead">Note for reviewer</div>', unsafe_allow_html=True)
-st.text_area(
-    "Note for reviewer",
-    key="review_batch_note",
-    label_visibility="collapsed",
-    placeholder="Optional note that will appear at the top of Cyndi's review page — batch-level context, alternate materials to watch for, special instructions, etc.",
-    height=100
-)
-st.caption("This note is saved into the review batch when you create the link. Per-image Analyst Notes still travel with their individual scenes.")
-
-st.markdown('<div class="gr-results-actions">', unsafe_allow_html=True)
-act_spacer, act_review, act_csv = st.columns([1.0,.34,.34], gap="small")
-with act_review:
-    if st.button("CREATE REVIEW LINK", type="primary", use_container_width=False):
-        batch_id, url = save_review_batch(results, st.session_state.get("review_batch_note", ""))
-        st.session_state.review_url = url
-        st.success("Review page created.")
-with act_csv:
-    st.download_button(
-        "DOWNLOAD CSV",
-        summary_df.to_csv(index=False).encode("utf-8-sig"),
-        "room_scene_analysis.csv",
-        "text/csv",
-        use_container_width=False
-    )
-st.markdown('</div>', unsafe_allow_html=True)
-
-if st.session_state.review_url:
-    review_id = st.session_state.review_url.split("review=", 1)[-1]
-    st.markdown(
-        f'<div class="gr-review-link"><div class="gr-library-eyebrow">REVIEW LINK READY</div>'
-        f'<code>{html.escape(st.session_state.review_url)}</code></div>',
-        unsafe_allow_html=True
-    )
-    r1, r2, r3 = st.columns([.22,.22,1], gap="small")
-    with r1:
-        st.markdown(
-            f'<a href="?review={html.escape(review_id)}" target="_blank" '
-            'style="display:inline-block;padding:10px 14px;background:#8f685d;color:white;text-decoration:none;'
-            'font-size:11px;font-weight:700;letter-spacing:.08em">TEST REVIEW PAGE</a>',
-            unsafe_allow_html=True
-        )
-    with r2:
-        st.caption("Make the Streamlit app public before sending this link outside your account.")
-
-    submitted_review = load_submission(review_id)
-    if submitted_review:
-        reviewer_name = submitted_review.get("reviewer") or "Reviewer"
-        st.success(f"Review submitted by {reviewer_name}. You can apply the approved decisions back to this analyzer batch.")
-        sr1, sr2, sr3 = st.columns([.28, .28, 1], gap="small")
-        with sr1:
-            if st.button("APPLY SUBMITTED REVIEW", type="primary", use_container_width=True):
-                applied = apply_submission_to_results(submitted_review)
-                st.success(f"Applied {applied} reviewed scene(s).")
-                st.rerun()
-        with sr2:
-            submitted_df = submission_dataframe(submitted_review)
-            st.download_button(
-                "DOWNLOAD REVIEW CSV",
-                submitted_df.to_csv(index=False).encode("utf-8-sig"),
-                f"room_scene_review_{review_id}.csv",
-                "text/csv",
-                use_container_width=True
-            )
-    else:
-        st.caption("Review status · Awaiting submission. Draft choices are autosaved on the review page.")
 
 st.markdown('<div class="gr-rule"></div>', unsafe_allow_html=True)
 left, center, right = st.columns([0.78, 1.38, 1.22], gap="large")
@@ -3941,17 +4229,20 @@ with right:
                 args=(idx, filename_key, generated_key)
             )
 
-        st.markdown('<div class="gr-minihead">4 · Analyst note</div>', unsafe_allow_html=True)
+        st.markdown('<div class="gr-minihead">4 · Note for reviewer · this scene</div>', unsafe_allow_html=True)
         analyst_note_key = f"main_analyst_note_{idx}"
         if analyst_note_key not in st.session_state:
             st.session_state[analyst_note_key] = str(item.get("analyst_note", "") or "")
         item["analyst_note"] = st.text_area(
-            "Analyst note",
+            "Analyst note for this scene",
             key=analyst_note_key,
             label_visibility="collapsed",
-            placeholder="Optional note for Cyndi — alternate slab candidates, uncertainty, context, etc.",
-            height=90
+            placeholder="Optional note for Cyndi about THIS scene — alternate slab candidates, uncertainty, context, etc.",
+            height=90,
+            on_change=save_main_analyst_note,
+            args=(idx, analyst_note_key)
         )
+        st.caption("This note travels with this individual scene on the review page.")
 
         with st.expander("Why did it choose this?", expanded=False):
             st.write(f"Filename evidence: **{analysis['filename_material_score']}%**")
@@ -3969,6 +4260,219 @@ with right:
             st.write("Labels:", ", ".join(v.get("labels", [])[:20]) or "—")
             st.write("Objects:", ", ".join(v.get("objects", [])[:20]) or "—")
 
+# Keep all scene-specific analyst notes synchronized before creating a review batch or CSV.
+sync_analyzer_notes_from_state(results)
+
+st.markdown('<div class="gr-minihead">Send scenes for review</div>', unsafe_allow_html=True)
+st.caption("Add any notes inside each scene's Review + Correct panel above. Those notes travel with that exact scene — there is no batch-level note.")
+st.markdown('<div class="gr-results-actions">', unsafe_allow_html=True)
+provider_label = email_provider_name()
+if email_configured():
+    st.caption(f"Email notifications · {provider_label} configured → {review_email_recipient()}")
+else:
+    st.warning("Email notifications are NOT configured. New live review links are blocked until this is fixed.")
+
+act_spacer, act_test, act_review, act_csv = st.columns([.75,.28,.34,.34], gap="small")
+with act_test:
+    if st.button("TEST EMAIL", use_container_width=False, disabled=not email_configured()):
+        try:
+            provider, recipient = send_test_review_notification()
+            st.success(f"Test email sent to {recipient} via {provider}.")
+        except Exception as e:
+            st.error(f"Email test failed: {e}")
+with act_review:
+    if st.button("CREATE REVIEW LINK", type="primary", use_container_width=False):
+        ok, email_status = email_preflight()
+        if not ok:
+            st.error(f"Review link not created. {email_status}")
+        else:
+            sync_analyzer_notes_from_state(results)
+            batch_id, url = save_review_batch(results)
+            st.session_state.review_url = url
+            st.success("Review page created. Email notification delivery passed preflight.")
+with act_csv:
+    review_link_df = pd.DataFrame([{
+        "Old Filename": x["name"],
+        "New Filename": x["new_name"],
+        "Material": x["stone"] or "Needs Review",
+        "SKU": x["sku"] or "NEED-SKU",
+        "Room": x["room"],
+        "Decision Status": x.get("decision_status",""),
+        "Material Confidence": f'{x["analysis"]["material_confidence"]}%',
+        "Room Confidence": f'{x["analysis"]["room_confidence"]}%',
+        "Method": x["analysis"]["material_method"],
+        "Website Verified": "YES" if x["analysis"].get("website_verified") else "NO",
+        "Analyst Note": x.get("analyst_note", ""),
+        "Reviewer Note": x.get("reviewer_note", "")
+    } for x in results])
+    st.download_button(
+        "DOWNLOAD CSV",
+        review_link_df.to_csv(index=False).encode("utf-8-sig"),
+        "room_scene_analysis.csv",
+        "text/csv",
+        use_container_width=False
+    )
+st.markdown('</div>', unsafe_allow_html=True)
+
+if st.session_state.review_url:
+    review_id = st.session_state.review_url.split("review=", 1)[-1]
+    st.markdown(
+        f'<div class="gr-review-link"><div class="gr-library-eyebrow">REVIEW LINK READY</div>'
+        f'<code>{html.escape(st.session_state.review_url)}</code></div>',
+        unsafe_allow_html=True
+    )
+    r1, r2, r3 = st.columns([.22,.22,1], gap="small")
+    with r1:
+        st.markdown(
+            f'<a href="?review={html.escape(review_id)}" target="_blank" '
+            'style="display:inline-block;padding:10px 14px;background:#8f685d;color:white;text-decoration:none;'
+            'font-size:11px;font-weight:700;letter-spacing:.08em">TEST REVIEW PAGE</a>',
+            unsafe_allow_html=True
+        )
+    with r2:
+        st.caption("Make the Streamlit app public before sending this link outside your account.")
+
+    apply_notice = st.session_state.pop("review_apply_notice", None)
+    if apply_notice:
+        applied_count, rejected_count = apply_notice
+        st.success(
+            f"Applied {applied_count} approved scene(s). "
+            f"Marked {rejected_count} rejected scene(s) as excluded from production export."
+        )
+
+    submitted_review = load_submission(review_id)
+    if submitted_review:
+        reviewer_name = submitted_review.get("reviewer") or "Reviewer"
+        st.success(f"Review submitted by {reviewer_name}. You can apply the approved decisions back to this analyzer batch.")
+        notify_status = load_notification_status(review_id) or {}
+        if notify_status.get("status") == "SENT":
+            st.caption(
+                f"Email delivery · SENT to {notify_status.get('recipient', review_email_recipient())} "
+                f"via {notify_status.get('provider', email_provider_name())}"
+            )
+        else:
+            delivery_label = notify_status.get("status") or "NO DELIVERY RECORD"
+            st.warning(f"Email delivery · {delivery_label}. The submission itself is safely stored.")
+            if notify_status.get("error"):
+                st.caption(f"Last email error · {notify_status.get('error')}")
+
+        sr1, sr2, sr3, sr4 = st.columns([.26, .26, .26, 1], gap="small")
+        with sr1:
+            if st.button("APPLY SUBMITTED REVIEW", type="primary", use_container_width=True):
+                applied, rejected = apply_submission_to_results(submitted_review)
+                st.session_state["review_apply_notice"] = (applied, rejected)
+                st.rerun()
+        with sr2:
+            submitted_df = submission_dataframe(submitted_review)
+            st.download_button(
+                "DOWNLOAD REVIEW CSV",
+                submitted_df.to_csv(index=False).encode("utf-8-sig"),
+                f"room_scene_review_{review_id}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+        with sr3:
+            resend_label = "RESEND EMAIL" if notify_status.get("status") == "SENT" else "SEND EMAIL NOW"
+            if st.button(resend_label, use_container_width=True):
+                ok, preflight_message = email_preflight()
+                if not ok:
+                    st.error(preflight_message)
+                else:
+                    sent, new_status = deliver_review_notification(review_id, submitted_review, attempts=3)
+                    if sent:
+                        st.success(f"Email sent to {new_status.get('recipient', review_email_recipient())}.")
+                        st.rerun()
+                    else:
+                        st.error(f"Email still failed: {new_status.get('error','Unknown error')}")
+    else:
+        st.caption("Review status · Awaiting submission. Draft choices are autosaved on the review page.")
+
+# Review inbox / delivery recovery. This is deliberately manual-refresh so listing a large
+# production bucket never slows ordinary image analysis.
+st.markdown('<div class="gr-minihead">Review inbox + email delivery</div>', unsafe_allow_html=True)
+st.caption("Use this to recover submitted reviews, see in-progress drafts, and send or retry email notifications without asking a reviewer to submit again.")
+with st.expander("OPEN REVIEW INBOX", expanded=False):
+    if st.button("REFRESH REVIEW INBOX", key="refresh_review_inbox") or "review_inbox_rows" not in st.session_state:
+        rows, inbox_error = list_review_batch_index()
+        st.session_state["review_inbox_rows"] = rows
+        st.session_state["review_inbox_error"] = inbox_error
+
+    inbox_error = st.session_state.get("review_inbox_error", "")
+    inbox_rows = st.session_state.get("review_inbox_rows", [])
+    if inbox_error:
+        st.error(inbox_error)
+    elif not inbox_rows:
+        st.caption("No review batches found yet. Click REFRESH REVIEW INBOX after creating a review link.")
+    else:
+        inbox_df = pd.DataFrame([{
+            "Batch": r["batch_id"],
+            "Status": r["state"],
+            "Draft": "YES" if r["draft"] else "",
+            "Submitted": "YES" if r["submission"] else "",
+            "Email record": "YES" if r["notification"] else "",
+        } for r in inbox_rows[:50]])
+        st.dataframe(inbox_df, hide_index=True, use_container_width=True)
+
+        inbox_batch_ids = [r["batch_id"] for r in inbox_rows]
+        selected_inbox_batch = st.selectbox(
+            "Inspect batch",
+            inbox_batch_ids,
+            key="review_inbox_selected_batch",
+        )
+        selected_record = next((r for r in inbox_rows if r["batch_id"] == selected_inbox_batch), None) or {}
+        inbox_submission = load_submission(selected_inbox_batch) if selected_record.get("submission") else None
+        inbox_notification = load_notification_status(selected_inbox_batch) if selected_record.get("notification") else None
+
+        if inbox_submission:
+            decisions = inbox_submission.get("decisions") or []
+            approved_total = sum(1 for d in decisions if d.get("approved"))
+            reviewer_name = inbox_submission.get("reviewer") or "Reviewer"
+            st.write(
+                f"**{selected_inbox_batch}** · submitted by **{reviewer_name}** · "
+                f"**{approved_total}/{len(decisions)} approved**"
+            )
+            if inbox_notification and inbox_notification.get("status") == "SENT":
+                st.success(
+                    f"Email SENT to {inbox_notification.get('recipient', review_email_recipient())} "
+                    f"via {inbox_notification.get('provider', email_provider_name())}."
+                )
+            else:
+                label = (inbox_notification or {}).get("status") or "NO DELIVERY RECORD"
+                st.warning(f"Email delivery · {label}")
+                if (inbox_notification or {}).get("error"):
+                    st.caption(f"Last error · {inbox_notification.get('error')}")
+
+            ib1, ib2 = st.columns([.28,.28], gap="small")
+            with ib1:
+                if st.button("SEND / RETRY EMAIL", key=f"inbox_send_{selected_inbox_batch}", use_container_width=True):
+                    ok, preflight_message = email_preflight()
+                    if not ok:
+                        st.error(preflight_message)
+                    else:
+                        sent, sent_status = deliver_review_notification(selected_inbox_batch, inbox_submission, attempts=3)
+                        if sent:
+                            st.success(f"Email sent to {sent_status.get('recipient', review_email_recipient())}.")
+                            rows, inbox_error = list_review_batch_index()
+                            st.session_state["review_inbox_rows"] = rows
+                            st.session_state["review_inbox_error"] = inbox_error
+                            st.rerun()
+                        else:
+                            st.error(f"Email failed: {sent_status.get('error','Unknown error')}")
+            with ib2:
+                inbox_csv = submission_dataframe(inbox_submission)
+                st.download_button(
+                    "DOWNLOAD REVIEW CSV",
+                    inbox_csv.to_csv(index=False).encode("utf-8-sig"),
+                    f"room_scene_review_{selected_inbox_batch}.csv",
+                    "text/csv",
+                    key=f"inbox_csv_{selected_inbox_batch}",
+                    use_container_width=True,
+                )
+        elif selected_record.get("draft"):
+            st.info("This batch has an autosaved draft but has not been submitted yet.")
+        elif selected_record.get("review"):
+            st.info("This batch was created and is awaiting reviewer activity.")
+
 st.markdown('<div class="gr-rule"></div>', unsafe_allow_html=True)
 st.markdown('<div class="gr-stephead"><div class="gr-step-left"><span class="gr-step-no">04</span><div><div class="gr-step-title">Export</div><div class="gr-step-sub">Download the corrected naming table for production.</div></div></div></div>', unsafe_allow_html=True)
 latest_summary_df = pd.DataFrame([{
@@ -3983,12 +4487,21 @@ latest_summary_df = pd.DataFrame([{
     "Method": x["analysis"]["material_method"],
     "Website Verified": "YES" if x["analysis"].get("website_verified") else "NO",
     "Analyst Note": x.get("analyst_note", ""),
-    "Reviewer Note": x.get("reviewer_note", "")
+    "Reviewer Note": x.get("reviewer_note", ""),
+    "Review Approval": (
+        "APPROVED" if x.get("review_approved") is True
+        else "REJECTED" if x.get("review_approved") is False
+        else "NOT REVIEWED"
+    )
 } for x in results])
 st.dataframe(latest_summary_df, use_container_width=True, hide_index=True)
 
-blockers, preflight_warnings = preflight_results(results)
+export_items = production_items(results)
+rejected_items = [x for x in results if x.get("review_approved") is False]
+blockers, preflight_warnings = preflight_results(export_items)
 st.markdown('<div class="gr-minihead">Production preflight</div>', unsafe_allow_html=True)
+if rejected_items:
+    st.info(f"{len(rejected_items)} reviewer-rejected scene(s) will be excluded from the renamed-image ZIP.")
 if blockers:
     st.error(f"{len(blockers)} blocking issue(s) must be resolved before renamed-image export.")
     for issue in blockers[:10]:
@@ -4017,7 +4530,7 @@ with ex2:
     else:
         st.download_button(
             "DOWNLOAD RENAMED IMAGES ZIP",
-            renamed_images_zip(results),
+            renamed_images_zip(export_items),
             "room_scenes_renamed.zip",
             "application/zip",
             use_container_width=True

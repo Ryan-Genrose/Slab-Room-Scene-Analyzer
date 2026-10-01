@@ -1,10 +1,12 @@
-# DEPLOYMENT GUIDE — GENROSE Room Scene Analyzer v0.9.3
+> **v0.9.8 production email:** Review submissions are saved to Google Cloud first, then notification delivery is audited separately. New live review links require a passing email preflight. See `EMAIL_NOTIFICATION_SETUP.md` for the one-time Google Apps Script setup.
+
+# DEPLOYMENT GUIDE — GENROSE Room Scene Analyzer v0.9.5
 
 You do not need to install Python locally. Everything can be done in a browser.
 
-## v0.9.3 upgrade notes
+## v0.9.5 upgrade notes
 
-No new secrets, APIs, or Python packages are required. Replace the deployed project files with this version and reboot the Streamlit app. Existing Google Cloud Storage review batches remain compatible. New review batches additionally save `analyst_note` and an autosaved `draft.json`.
+No new secrets, APIs, or Python packages are required. If v0.9.4 is already deployed, replacing `app.py` is enough for the code change. Existing Google Cloud Storage review batches remain readable. New review batches use only per-scene `analyst_note` values; the batch-level reviewer note introduced in v0.9.4 is no longer created or displayed. Manual material thumbnails and autosaved review drafts remain compatible.
 
 ---
 
@@ -18,8 +20,8 @@ No new secrets, APIs, or Python packages are required. Replace the deployed proj
 5. Choose **Private** if you do not want the code public.
 6. Click **Create repository**.
 7. On the empty repository page, click **uploading an existing file**.
-8. Unzip the downloaded `Slab_Room_Scene_Manager_v0.9.3.zip`.
-9. Open the folder `Slab_Room_Scene_Manager_v0.9.3`.
+8. Unzip the downloaded `Slab_Room_Scene_Manager_v0.9.5.zip`.
+9. Open the folder `Slab_Room_Scene_Manager_v0.9.5`.
 10. Drag everything INSIDE that folder into GitHub.
     The GitHub repository root should directly contain:
     - `app.py`
@@ -339,3 +341,8 @@ for each successfully resolved material.
 
 ## v0.9.2 safe refresh
 Deploy this version before refreshing again. The refresh is now transactional and non-destructive. It preserves the existing library entry for a material until a strict `-Slab` replacement succeeds, and it checkpoints merged progress during the run.
+
+
+## Material thumbnail persistence (v0.9.4)
+
+No new secrets are required. When `GOOGLE_CLOUD_BUCKET` is configured, manually added material thumbnails are stored under `material_thumbnails/<sku>/thumbnail.jpg`. Without cloud storage they fall back to `.runtime_data/material_thumbnails/`, which is suitable for local testing but is not durable on Streamlit Community Cloud.
