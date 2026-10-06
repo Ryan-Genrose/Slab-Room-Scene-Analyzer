@@ -1,4 +1,4 @@
-> **v0.9.8 production email:** Review submissions are saved to Google Cloud first, then notification delivery is audited separately. New live review links require a passing email preflight. See `EMAIL_NOTIFICATION_SETUP.md` for the one-time Google Apps Script setup.
+> **v0.9.9 production email:** Review submissions are saved to Google Cloud first, then notification delivery is audited separately. New live review links require a passing email preflight. See `EMAIL_NOTIFICATION_SETUP.md` for the one-time Google Apps Script setup.
 
 # GENROSE Room Scene Analyzer v0.9.5
 

@@ -35,7 +35,7 @@ try:
 except Exception:
     GOOGLE_LIBS = False
 
-APP_VERSION = "0.9.8"
+APP_VERSION = "0.9.9"
 
 st.set_page_config(page_title="GENROSE Room Scene Analyzer", page_icon="🪨", layout="wide", initial_sidebar_state="collapsed")
 
@@ -1983,6 +1983,13 @@ def email_provider_name():
     return "Not configured"
 
 
+def email_audit_recipient():
+    """Human-readable destination for delivery status. Formspree owns the actual target address."""
+    if email_provider_name() == "Formspree":
+        return "recipient configured in Formspree"
+    return review_email_recipient()
+
+
 def email_configured():
     return email_provider_name() != "Not configured"
 
@@ -2013,8 +2020,13 @@ def email_preflight():
         except Exception as e:
             return False, f"Email webhook could not be reached: {type(e).__name__}: {str(e)[:180]}"
 
-    # Legacy providers remain supported for existing deployments, but they do not expose
-    # a safe no-send health endpoint. Their credentials are checked for completeness.
+    # Formspree owns its target recipient in the Formspree workflow; the app only
+    # needs the endpoint. Do not pretend the hard-coded REVIEW_EMAIL is the target.
+    if email_provider_name() == "Formspree":
+        return True, "Formspree configured · target recipient is managed in Formspree."
+
+    # Other legacy providers do not expose a safe no-send health endpoint. Their
+    # credentials are checked for completeness here.
     if email_configured():
         return True, f"{email_provider_name()} configured · notifications go to {review_email_recipient()}"
     return False, "Email notifications are not configured. Live review links are disabled until notification delivery is configured."
@@ -2042,7 +2054,7 @@ def send_review_email(subject, html_body, text_body, batch_id="", reviewer=""):
             },
             timeout=30,
             allow_redirects=True,
-            headers={"Content-Type": "application/json", "User-Agent": "GENROSE-Room-Scene-Analyzer/0.9.8"},
+            headers={"Content-Type": "application/json", "User-Agent": "GENROSE-Room-Scene-Analyzer/0.9.9"},
         )
         if r.status_code >= 300:
             raise RuntimeError(f"Google Apps Script returned HTTP {r.status_code}: {r.text[:250]}")
@@ -2054,16 +2066,16 @@ def send_review_email(subject, html_body, text_body, batch_id="", reviewer=""):
             raise RuntimeError(str(data.get("error") or "Google Apps Script reported an email failure."))
         return "Google Apps Script"
 
-    # Legacy option 1: Formspree endpoint configured to deliver to the review inbox.
-    formspree = secret("FORMSPREE_ENDPOINT", "")
+    # Formspree is the simple production relay. The target address is configured
+    # in Formspree itself, so do NOT send a fake recipient field here. Also do not
+    # send HTML as a form field: Formspree would print the raw markup in the email.
+    formspree = str(secret("FORMSPREE_ENDPOINT", "") or "").strip()
     if formspree:
         r = requests.post(
             formspree,
             data={
                 "_subject": subject,
-                "message": text_body,
-                "html": html_body,
-                "recipient": recipient
+                "Review Summary": text_body,
             },
             timeout=30,
             headers={"Accept": "application/json"}
@@ -2153,44 +2165,96 @@ def load_notification_status(batch_id):
 
 
 def build_review_email(batch_id, submission):
+    """Build both HTML and clean plain-text review summaries.
+
+    Formspree uses the plain-text version. Resend/SMTP/Apps Script may use HTML.
+    """
     decisions = list((submission or {}).get("decisions") or [])
     reviewer = str((submission or {}).get("reviewer") or "").strip()
-    approved_count = sum(1 for d in decisions if d.get("approved"))
-    rejected_count = len(decisions) - approved_count
+    approved = [d for d in decisions if d.get("approved")]
+    rejected = [d for d in decisions if not d.get("approved")]
+    approved_count = len(approved)
+    rejected_count = len(rejected)
+
+    # IMPORTANT: keep the same prefix as the TEST EMAIL so Outlook rules that
+    # match "GENROSE Room Scene Review" catch both tests and real submissions.
+    subject = (
+        f"GENROSE Room Scene Review — Submitted — {reviewer or 'Reviewer'} — "
+        f"{approved_count}/{len(decisions)} approved"
+    )
+    submitted_at = str((submission or {}).get("submitted_at") or "")
+    batch_note = str((submission or {}).get("analyst_batch_note") or "").strip()
+
+    def clean(value):
+        return str(value or "").strip()
+
+    def text_item(d, is_approved):
+        mark = "APPROVED" if is_approved else "NOT APPROVED"
+        material = clean(d.get("final_material")) or "No material selected"
+        sku = clean(d.get("final_sku")) or "No SKU"
+        room = clean(d.get("final_room")) or "No room selected"
+        filename = clean(d.get("final_filename")) or "No final filename"
+        old_name = clean(d.get("old_filename"))
+        reviewer_note = clean(d.get("reviewer_note", d.get("notes", "")))
+        analyst_note = clean(d.get("analyst_note"))
+        lines = [
+            f"{mark}: {material} — {room}",
+            f"  Final: {filename}",
+            f"  SKU: {sku}",
+            f"  Original: {old_name}",
+        ]
+        if reviewer_note:
+            lines.append(f"  Reviewer note: {reviewer_note}")
+        if analyst_note:
+            lines.append(f"  Analyst note: {analyst_note}")
+        return "\n".join(lines)
+
+    sections = [
+        "GENROSE ROOM SCENE REVIEW",
+        "",
+        f"Reviewer: {reviewer or 'Not supplied'}",
+        f"Batch: {batch_id}",
+        f"Approved: {approved_count} of {len(decisions)}",
+        f"Not approved: {rejected_count}",
+    ]
+    if submitted_at:
+        sections.append(f"Submitted: {submitted_at}")
+    if batch_note:
+        sections += ["", "ANALYST BATCH NOTE", batch_note]
+
+    sections += ["", "APPROVED SCENES"]
+    if approved:
+        for n, d in enumerate(approved, 1):
+            sections += ["", f"{n}. {text_item(d, True)}"]
+    else:
+        sections += ["", "None"]
+
+    sections += ["", "NOT APPROVED"]
+    if rejected:
+        for n, d in enumerate(rejected, 1):
+            sections += ["", f"{n}. {text_item(d, False)}"]
+    else:
+        sections += ["", "None"]
+
+    text_body = "\n".join(sections).strip()
 
     html_rows = []
-    text_rows = []
     for d in decisions:
         status = "APPROVED" if d.get("approved") else "NOT APPROVED"
         html_rows.append(
             "<tr>"
             f"<td>{html.escape(status)}</td>"
-            f"<td>{html.escape(str(d.get('decision_status','')))}</td>"
-            f"<td>{html.escape(str(d.get('old_filename','')))}</td>"
-            f"<td>{html.escape(str(d.get('final_filename','')))}</td>"
-            f"<td>{html.escape(str(d.get('suggested_material','')))}</td>"
-            f"<td>{html.escape(str(d.get('final_material','')))}</td>"
-            f"<td>{html.escape(str(d.get('final_sku','')))}</td>"
-            f"<td>{html.escape(str(d.get('final_room','')))}</td>"
-            f"<td>{html.escape(str(d.get('material_confidence','')))}%</td>"
-            f"<td>{html.escape(str(d.get('analyst_note','')))}</td>"
-            f"<td>{html.escape(str(d.get('reviewer_note', d.get('notes',''))))}</td>"
+            f"<td>{html.escape(clean(d.get('final_material')))}</td>"
+            f"<td>{html.escape(clean(d.get('final_sku')))}</td>"
+            f"<td>{html.escape(clean(d.get('final_room')))}</td>"
+            f"<td>{html.escape(clean(d.get('final_filename')))}</td>"
+            f"<td>{html.escape(clean(d.get('reviewer_note', d.get('notes',''))))}</td>"
             "</tr>"
         )
-        text_rows.append(
-            f"{status} | OLD={d.get('old_filename','')} | NEW={d.get('final_filename','')} | "
-            f"MATERIAL={d.get('final_material','')} | SKU={d.get('final_sku','')} | ROOM={d.get('final_room','')} | "
-            f"CONF={d.get('material_confidence','')}% | ANALYST={d.get('analyst_note','')} | "
-            f"REVIEWER={d.get('reviewer_note', d.get('notes',''))}"
-        )
-
-    subject = (
-        f"Room Scene Review Submitted — {reviewer or 'Reviewer'} — "
-        f"{approved_count}/{len(decisions)} approved"
+    batch_note_html = (
+        f"<p><strong>Analyst batch note:</strong><br>{html.escape(batch_note).replace(chr(10), '<br>')}</p>"
+        if batch_note else ""
     )
-    submitted_at = str((submission or {}).get("submitted_at") or "")
-    batch_note = str((submission or {}).get("analyst_batch_note") or "").strip()
-    batch_note_html = f"<p><strong>Analyst batch note:</strong><br>{html.escape(batch_note).replace(chr(10), '<br>')}</p>" if batch_note else ""
     html_body = (
         f"<h2>{html.escape(subject)}</h2>"
         f"<p><strong>Batch:</strong> {html.escape(batch_id)}<br>"
@@ -2199,24 +2263,14 @@ def build_review_email(batch_id, submission):
         f"<strong>Submitted:</strong> {html.escape(submitted_at or 'Just now')}</p>"
         + batch_note_html
         + "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse'>"
-        + "<thead><tr>"
-        "<th>Status</th><th>Decision</th><th>Old filename</th><th>Final filename</th><th>Suggested material</th>"
-        "<th>Final material</th><th>SKU</th><th>Room</th><th>Confidence</th><th>Analyst note</th><th>Reviewer note</th>"
-        "</tr></thead><tbody>" + "".join(html_rows) + "</tbody></table>"
-    )
-    text_body = (
-        subject + "\n"
-        + f"Batch: {batch_id}\nReviewer: {reviewer or 'Not supplied'}\n"
-        + f"Approved: {approved_count} | Not approved: {rejected_count}\n"
-        + (f"Analyst batch note: {batch_note}\n" if batch_note else "")
-        + "\n".join(text_rows)
+        + "<thead><tr><th>Status</th><th>Material</th><th>SKU</th><th>Room</th><th>Final filename</th><th>Reviewer note</th></tr></thead>"
+        + "<tbody>" + "".join(html_rows) + "</tbody></table>"
     )
     return subject, html_body, text_body
 
-
 def deliver_review_notification(batch_id, submission, attempts=3):
     """Send and audit a review-complete email. Never changes the saved submission."""
-    recipient = review_email_recipient()
+    recipient = email_audit_recipient()
     if not email_configured():
         status = save_notification_status(batch_id, {
             "status": "NOT_CONFIGURED",
@@ -2281,7 +2335,7 @@ def send_test_review_notification():
         "<p>If you received this, review-complete email delivery is configured.</p>"
     )
     provider = send_review_email(subject, html_body, text_body, batch_id="TEST", reviewer="System test")
-    return provider, review_email_recipient()
+    return provider, email_audit_recipient()
 
 
 GENROSE_STYLE = r"""
@@ -3370,11 +3424,19 @@ def render_review_page(batch_id):
         notify_status = load_notification_status(batch_id) or {}
         if notify_status.get("status") == "SENT":
             st.caption(
-                f"Email notification · SENT to {notify_status.get('recipient', review_email_recipient())} "
-                f"via {notify_status.get('provider', email_provider_name())}"
+                f"Email notification · ACCEPTED by {notify_status.get('provider', email_provider_name())} · "
+                f"{notify_status.get('recipient', email_audit_recipient())}"
             )
         else:
-            st.warning("This submission does not have a confirmed email-delivery record yet. The review itself is safely stored.")
+            st.warning("This submission does not have an email-notification record yet. The review itself is safely stored.")
+            if email_configured():
+                if st.button("RETRY EMAIL NOTIFICATION", key=f"review_retry_email_{batch_id}"):
+                    sent, retry_status = deliver_review_notification(batch_id, completed, attempts=3)
+                    if sent:
+                        st.success(f"Notification accepted by {retry_status.get('provider', email_provider_name())}.")
+                        st.rerun()
+                    else:
+                        st.error(f"Email failed: {retry_status.get('error','Unknown error')}")
     elif draft:
         st.info("An autosaved review draft was restored for this batch.")
 
@@ -3675,8 +3737,8 @@ def render_review_page(batch_id):
         sent, notify_status = deliver_review_notification(batch_id, submission, attempts=3)
         if sent:
             st.success(
-                f"Email notification sent to {notify_status.get('recipient', review_email_recipient())} "
-                f"via {notify_status.get('provider', email_provider_name())}."
+                f"Email notification accepted by {notify_status.get('provider', email_provider_name())}. "
+                f"Destination · {notify_status.get('recipient', email_audit_recipient())}."
             )
         else:
             st.error(
@@ -4268,7 +4330,10 @@ st.caption("Add any notes inside each scene's Review + Correct panel above. Thos
 st.markdown('<div class="gr-results-actions">', unsafe_allow_html=True)
 provider_label = email_provider_name()
 if email_configured():
-    st.caption(f"Email notifications · {provider_label} configured → {review_email_recipient()}")
+    if provider_label == "Formspree":
+        st.caption("Email notifications · Formspree configured · recipient is managed in Formspree")
+    else:
+        st.caption(f"Email notifications · {provider_label} configured → {review_email_recipient()}")
 else:
     st.warning("Email notifications are NOT configured. New live review links are blocked until this is fixed.")
 
@@ -4277,7 +4342,10 @@ with act_test:
     if st.button("TEST EMAIL", use_container_width=False, disabled=not email_configured()):
         try:
             provider, recipient = send_test_review_notification()
-            st.success(f"Test email sent to {recipient} via {provider}.")
+            if provider == "Formspree":
+                st.success("Test notification accepted by Formspree. Check the Formspree target inbox / Outlook forwarding rule.")
+            else:
+                st.success(f"Test email sent to {recipient} via {provider}.")
         except Exception as e:
             st.error(f"Email test failed: {e}")
 with act_review:
@@ -4347,8 +4415,8 @@ if st.session_state.review_url:
         notify_status = load_notification_status(review_id) or {}
         if notify_status.get("status") == "SENT":
             st.caption(
-                f"Email delivery · SENT to {notify_status.get('recipient', review_email_recipient())} "
-                f"via {notify_status.get('provider', email_provider_name())}"
+                f"Email notification · ACCEPTED by {notify_status.get('provider', email_provider_name())} · "
+                f"{notify_status.get('recipient', email_audit_recipient())}"
             )
         else:
             delivery_label = notify_status.get("status") or "NO DELIVERY RECORD"
@@ -4380,7 +4448,7 @@ if st.session_state.review_url:
                 else:
                     sent, new_status = deliver_review_notification(review_id, submitted_review, attempts=3)
                     if sent:
-                        st.success(f"Email sent to {new_status.get('recipient', review_email_recipient())}.")
+                        st.success(f"Email notification accepted by {new_status.get('provider', email_provider_name())}.")
                         st.rerun()
                     else:
                         st.error(f"Email still failed: {new_status.get('error','Unknown error')}")
@@ -4433,8 +4501,8 @@ with st.expander("OPEN REVIEW INBOX", expanded=False):
             )
             if inbox_notification and inbox_notification.get("status") == "SENT":
                 st.success(
-                    f"Email SENT to {inbox_notification.get('recipient', review_email_recipient())} "
-                    f"via {inbox_notification.get('provider', email_provider_name())}."
+                    f"Email notification ACCEPTED by {inbox_notification.get('provider', email_provider_name())} · "
+                    f"{inbox_notification.get('recipient', email_audit_recipient())}."
                 )
             else:
                 label = (inbox_notification or {}).get("status") or "NO DELIVERY RECORD"
@@ -4451,7 +4519,7 @@ with st.expander("OPEN REVIEW INBOX", expanded=False):
                     else:
                         sent, sent_status = deliver_review_notification(selected_inbox_batch, inbox_submission, attempts=3)
                         if sent:
-                            st.success(f"Email sent to {sent_status.get('recipient', review_email_recipient())}.")
+                            st.success(f"Email notification accepted by {sent_status.get('provider', email_provider_name())}.")
                             rows, inbox_error = list_review_batch_index()
                             st.session_state["review_inbox_rows"] = rows
                             st.session_state["review_inbox_error"] = inbox_error
